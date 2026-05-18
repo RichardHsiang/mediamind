@@ -1,0 +1,784 @@
+import Foundation
+
+struct ReportService {
+    static let shared = ReportService()
+
+    func generateAnalysisReport(transcription: String, rawTranscription: String, analysis: String, outputDir: URL, screenshotURLs: [URL] = []) async throws -> [URL] {
+        let transcriptionURL = outputDir.appendingPathComponent("audio.md")
+        let transcriptionContent = """
+        # 原始转录文本
+
+        \(rawTranscription)
+
+        ---
+
+        *生成时间: \(Date().formatted())*
+        """
+        try transcriptionContent.write(to: transcriptionURL, atomically: true, encoding: .utf8)
+
+        let analysisURL = outputDir.appendingPathComponent("audio_analysis.md")
+        var analysisContent = """
+        # AI 分析结果
+
+        \(analysis)
+
+        """
+
+        if !screenshotURLs.isEmpty {
+            analysisContent += """
+            ## 关键画面截图
+
+            """
+            for (index, screenshotURL) in screenshotURLs.enumerated() {
+                let relativePath = "images/\(screenshotURL.lastPathComponent)"
+                analysisContent += """
+                ### 截图 \(index + 1)
+
+                ![截图\(index + 1)](\(relativePath))
+
+                """
+            }
+        }
+
+        analysisContent += """
+
+        ---
+
+        *生成时间: \(Date().formatted())*
+        """
+        try analysisContent.write(to: analysisURL, atomically: true, encoding: .utf8)
+
+        return [transcriptionURL, analysisURL]
+    }
+
+    func generateMeetingReport(transcription: String, analysis: String, template: ReportTemplate, outputDir: URL, templatePath: String? = nil) async throws -> URL {
+        let outputURL = outputDir.appendingPathComponent("meeting_report.html")
+
+        guard let path = templatePath, !path.isEmpty else {
+            print("[ReportService] No template path configured")
+            throw ProcessingError.templatePathNotConfigured
+        }
+
+        // Load custom template
+        if let templateContent = TemplateService.shared.loadTemplate(named: "meeting", from: path) {
+            // Use custom template
+            let cleanAnalysis = cleanMarkdown(analysis)
+            let meetingInfo = parseMeetingInfo(from: cleanAnalysis)
+            let contentBlocks = parseContentBlocks(from: cleanAnalysis)
+            
+            let meetingContentHTML = generateMeetingContentHTML(meetingInfo: meetingInfo, contentBlocks: contentBlocks)
+            let htmlContent = replaceTemplatePlaceholders(in: templateContent, with: meetingContentHTML, meetingInfo: meetingInfo)
+            
+            try htmlContent.write(to: outputURL, atomically: true, encoding: .utf8)
+            return outputURL
+        } else {
+            // Fallback to built-in generation
+            let cleanAnalysis = cleanMarkdown(analysis)
+            let meetingInfo = parseMeetingInfo(from: cleanAnalysis)
+            let contentBlocks = parseContentBlocks(from: cleanAnalysis)
+
+            let htmlContent = generateMeetingHTML(
+                meetingInfo: meetingInfo,
+                contentBlocks: contentBlocks
+            )
+
+            try htmlContent.write(to: outputURL, atomically: true, encoding: .utf8)
+            return outputURL
+        }
+    }
+
+    func generateSubtitleFile(segments: [TranscriptionSegment], outputDir: URL, format: String = "SRT", languageOrder: String = "cn-en", baseFileName: String = "subtitles") async throws -> URL {
+        let ext = format.lowercased()
+        let outputURL = outputDir.appendingPathComponent("\(baseFileName).\(ext)")
+
+        let content: String
+        switch ext {
+        case "srt":
+            content = generateSRT(segments: segments)
+        case "vtt":
+            content = generateVTT(segments: segments)
+        case "ass":
+            content = generateASS(segments: segments)
+        default:
+            content = generateSRT(segments: segments)
+        }
+
+        try content.write(to: outputURL, atomically: true, encoding: .utf8)
+        return outputURL
+    }
+
+    private func generateSRT(segments: [TranscriptionSegment]) -> String {
+        var lines: [String] = []
+        for (index, segment) in segments.enumerated() {
+            lines.append("\(index + 1)")
+            lines.append("\(segment.startTime),000 --> \(segment.endTime),000")
+            lines.append(segment.text)
+            lines.append("")
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    private func generateVTT(segments: [TranscriptionSegment]) -> String {
+        var lines: [String] = ["WEBVTT", ""]
+        for segment in segments {
+            lines.append("\(segment.startTime).000 --> \(segment.endTime).000")
+            lines.append(segment.text)
+            lines.append("")
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    private func generateASS(segments: [TranscriptionSegment]) -> String {
+        var lines: [String] = [
+            "[Script Info]",
+            "Title: Generated by MediaMind",
+            "ScriptType: v4.00+",
+            "",
+            "[V4+ Styles]",
+            "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding",
+            "Style: Default,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1",
+            "",
+            "[Events]",
+            "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text"
+        ]
+
+        for segment in segments {
+            lines.append("Dialogue: 0,\(segment.startTime),\(segment.endTime),Default,\(segment.speaker),0,0,0,,\(segment.text)")
+        }
+
+        return lines.joined(separator: "\n")
+    }
+
+    // MARK: - Meeting Report HTML Generation
+
+    private func generateMeetingContentHTML(meetingInfo: MeetingInfo, contentBlocks: ContentBlocks) -> String {
+        let previousIssuesHTML = convertToParagraphs(contentBlocks.previousIssues)
+        let currentContentHTML = convertToParagraphs(contentBlocks.currentContent)
+        let resolutionsHTML = convertToParagraphs(contentBlocks.resolutions)
+
+        return """
+        <div class="content-block">
+            <div class="content-block-title">一、上次会议问题的对策及关闭情况</div>
+            <div class="content-block-body">
+                \(previousIssuesHTML)
+            </div>
+        </div>
+
+        <div class="content-block">
+            <div class="content-block-title">二、本次会议内容</div>
+            <div class="content-block-body">
+                \(currentContentHTML)
+            </div>
+        </div>
+
+        <div class="content-block">
+            <div class="content-block-title">三、本次会议决议</div>
+            <div class="content-block-body">
+                \(resolutionsHTML)
+            </div>
+        </div>
+        """
+    }
+
+    private func generateMeetingHTML(meetingInfo: MeetingInfo, contentBlocks: ContentBlocks) -> String {
+        let meetingContentHTML = generateMeetingContentHTML(meetingInfo: meetingInfo, contentBlocks: contentBlocks)
+        let pagesHTML = generatePages(meetingInfo: meetingInfo, contentHTML: meetingContentHTML)
+        return wrapInHTMLDocument(bodyContent: pagesHTML)
+    }
+    
+    /// Replace placeholders in custom template with actual content
+    private func replaceTemplatePlaceholders(in template: String, with contentHTML: String, meetingInfo: MeetingInfo) -> String {
+        var result = template
+        
+        // Replace content placeholder
+        result = result.replacingOccurrences(of: "请输入会议内容...", with: contentHTML)
+        
+        // Replace meeting info placeholders if they exist in the template
+        result = result.replacingOccurrences(of: "placeholder=\"请输入会议主题...\"", with: "value=\"\(escapeHTML(meetingInfo.theme))\"")
+        result = result.replacingOccurrences(of: "placeholder=\"请输入编号...\"", with: "value=\"\(escapeHTML(meetingInfo.host))\"")
+        result = result.replacingOccurrences(of: "placeholder=\"请输入会议时间...\"", with: "value=\"\(escapeHTML(meetingInfo.time))\"")
+        result = result.replacingOccurrences(of: "placeholder=\"请输入会议地点...\"", with: "value=\"\(escapeHTML(meetingInfo.location))\"")
+        result = result.replacingOccurrences(of: "placeholder=\"请输入参会人员...\"", with: "\(escapeHTML(meetingInfo.participants))")
+        
+        return result
+    }
+    
+    /// 生成多页内容，自动分页 - 改进版：尊重内容块完整性，只在必要时分页
+    private func generatePages(meetingInfo: MeetingInfo, contentHTML: String) -> String {
+        // Split content into logical blocks (sections, paragraphs, etc.)
+        let blocks = contentHTML.components(separatedBy: "<div class=\"content-block\">")
+        var blockContents: [String] = []
+        
+        for block in blocks {
+            if block.isEmpty { continue }
+            let fullBlock = "<div class=\"content-block\">" + block
+            blockContents.append(fullBlock)
+        }
+        
+        if blockContents.isEmpty {
+            return contentHTML
+        }
+        
+        var pages: [String] = []
+        var currentPage = ""
+        
+        for blockHTML in blockContents {
+            // If current page is empty, start with this block
+            if currentPage.isEmpty {
+                currentPage = blockHTML
+                continue
+            }
+            
+            // Try adding this block to current page
+            let testPage = currentPage + blockHTML
+            
+            // Simple approach: Add block to current page, and if it gets too long (heuristic),
+            // finalize current page and start new one
+            // This mimics "fill current page then break" behavior better than fixed char limits
+            
+            if currentPage.count > 1200 { // Increased threshold for better content flow
+                pages.append(currentPage)
+                currentPage = blockHTML
+            } else {
+                currentPage = testPage
+            }
+        }
+        
+        // Don't forget the last page
+        if !currentPage.isEmpty {
+            pages.append(currentPage)
+        }
+        
+        // If we somehow ended up with no pages, fall back to original content
+        if pages.isEmpty {
+            pages = [contentHTML]
+        }
+        
+        // Generate HTML for each page
+        var html = ""
+        let totalPages = pages.count
+        
+        for (index, pageContent) in pages.enumerated() {
+            let pageNum = index + 1
+            let isFirst = index == 0
+            let isLast = index == totalPages - 1
+            
+            html += generatePageContent(
+                pageNumber: pageNum,
+                totalPages: totalPages,
+                meetingInfo: meetingInfo,
+                contentHTML: pageContent,
+                showHeader: isFirst,
+                showSignature: isLast
+            )
+        }
+        
+        return html
+    }
+
+    private func generatePageContent(pageNumber: Int, totalPages: Int, meetingInfo: MeetingInfo, contentHTML: String, showHeader: Bool, showSignature: Bool) -> String {
+        let headerHTML = showHeader ? """
+                <h1 class="title">会 议 纪 要</h1>
+
+                <table class="info-table">
+                    <tr>
+                        <td class="label">会议主题</td>
+                        <td class="content-cell">
+                            <input type="text" value="\(escapeHTML(meetingInfo.theme))" placeholder="请输入会议主题...">
+                        </td>
+                        <td class="label" style="width: 50px;">编号</td>
+                        <td class="content-cell" style="width: 33%;">
+                            <input type="text" value="\(escapeHTML(meetingInfo.host))" placeholder="请输入编号...">
+                        </td>
+                    </tr>
+                    <tr>
+                        <td class="label">会议时间</td>
+                        <td class="content-cell">
+                            <input type="text" value="\(escapeHTML(meetingInfo.time))" placeholder="请输入会议时间...">
+                        </td>
+                        <td class="label" style="width: 50px;">会议地点</td>
+                        <td class="content-cell" style="width: 33%;">
+                            <input type="text" value="\(escapeHTML(meetingInfo.location))" placeholder="请输入会议地点...">
+                        </td>
+                    </tr>
+                    <tr>
+                        <td class="label">参会人员</td>
+                        <td class="content-cell" colspan="3">
+                            <textarea placeholder="请输入参会人员...">\(escapeHTML(meetingInfo.participants))</textarea>
+                        </td>
+                    </tr>
+                </table>
+        """ : ""
+
+        let contentSectionClass = showHeader ? "content-section" : "content-section continued"
+
+        let signatureHTML = showSignature ? """
+                <table class="signature-table">
+                    <tr>
+                        <td class="label">编制</td>
+                        <td class="sign-cell"><input type="text" placeholder=""></td>
+                        <td class="label">审核</td>
+                        <td class="sign-cell"><input type="text" placeholder=""></td>
+                        <td class="label">批准</td>
+                        <td class="sign-cell"><input type="text" placeholder=""></td>
+                    </tr>
+                </table>
+        """ : ""
+
+        return """
+            <div class="page">
+                \(headerHTML)
+
+                <div class="\(contentSectionClass)">
+                    <div class="content-header">会议内容</div>
+                    <div class="content-body">
+                        \(contentHTML)
+                    </div>
+                </div>
+
+                \(signatureHTML)
+
+                <div class="page-number">第 \(pageNumber) 页 共 \(totalPages) 页</div>
+            </div>
+        """
+    }
+
+    private func wrapInHTMLDocument(bodyContent: String) -> String {
+        return """
+        <!DOCTYPE html>
+        <html lang="zh-CN">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>会议纪要</title>
+            <style>
+                * {
+                    margin: 0;
+                    padding: 0;
+                    box-sizing: border-box;
+                }
+
+                @page {
+                    size: A4;
+                    margin: 0;
+                }
+
+                body {
+                    font-family: "SimSun", "宋体", serif;
+                    font-size: 12pt;
+                    line-height: 1.5;
+                    background: #f5f5f5;
+                    padding: 10px;
+                }
+
+                .page {
+                    width: 210mm;
+                    height: 297mm;
+                    margin: 0 auto 20px;
+                    background: white;
+                    padding: 15mm 20mm 10mm 20mm;
+                    box-shadow: 0 0 10px rgba(0,0,0,0.1);
+                    overflow: hidden;
+                    page-break-after: always;
+                    position: relative;
+                }
+
+                .page:last-child {
+                    page-break-after: auto;
+                    margin-bottom: 0;
+                }
+
+                .title {
+                    text-align: center;
+                    font-size: 22pt;
+                    font-weight: bold;
+                    letter-spacing: 10px;
+                    margin-bottom: 10px;
+                    color: #333;
+                    height: 40px;
+                    line-height: 40px;
+                }
+
+                .info-table {
+                    width: 100%;
+                    border-collapse: collapse;
+                    border: 2pt solid #000;
+                    margin-bottom: 0;
+                }
+
+                .info-table td,
+                .info-table th {
+                    border: 1px solid #333;
+                    padding: 5px 10px;
+                    vertical-align: middle;
+                    height: 32px;
+                }
+
+                .info-table .label {
+                    background-color: #f9f9f9;
+                    font-weight: normal;
+                    text-align: center;
+                    width: 80px;
+                    white-space: nowrap;
+                    font-size: 12pt;
+                }
+
+                .info-table .content-cell {
+                    text-align: left;
+                }
+
+                .info-table input[type="text"],
+                .info-table textarea {
+                    width: 100%;
+                    border: none;
+                    outline: none;
+                    font-family: inherit;
+                    font-size: 12pt;
+                    background: transparent;
+                    resize: none;
+                }
+
+                .info-table input[type="text"] {
+                    height: 20px;
+                }
+
+                .info-table textarea {
+                    height: 28px;
+                    line-height: 1.4;
+                }
+
+                .content-section {
+                    border: 2pt solid #000;
+                    border-top: none;
+                    height: calc(297mm - 40px - 96px - 40px - 10mm - 25mm);
+                    overflow: hidden;
+                    display: flex;
+                    flex-direction: column;
+                }
+
+                .content-section.continued {
+                    border-top: 2pt solid #000;
+                    height: calc(297mm - 40px - 10mm - 25mm);
+                }
+
+                .signature-table {
+                    width: 100%;
+                    border-collapse: collapse;
+                    border: 2pt solid #000;
+                    border-top: none;
+                }
+
+                .signature-table td {
+                    border: 1px solid #333;
+                    padding: 5px 10px;
+                    vertical-align: middle;
+                    text-align: center;
+                    height: 32px;
+                }
+
+                .signature-table .label {
+                    background-color: #f9f9f9;
+                    width: 50px;
+                    white-space: nowrap;
+                    font-size: 12pt;
+                }
+
+                .signature-table .sign-cell {
+                    width: 100px;
+                }
+
+                .signature-table input[type="text"] {
+                    width: 100%;
+                    border: none;
+                    outline: none;
+                    font-family: inherit;
+                    font-size: 12pt;
+                    background: transparent;
+                    height: 20px;
+                    text-align: center;
+                }
+
+                .content-header {
+                    text-align: center;
+                    font-size: 13pt;
+                    font-weight: bold;
+                    padding: 5px;
+                    border-bottom: 2pt solid #000;
+                    background-color: #f9f9f9;
+                    height: 32px;
+                    line-height: 22px;
+                    flex-shrink: 0;
+                }
+
+                .content-body {
+                    padding: 8px 10px;
+                    flex: 1;
+                    font-size: 12pt;
+                    line-height: 1.6;
+                    outline: none;
+                }
+
+                .content-body:focus {
+                    background-color: #fafafa;
+                }
+
+                .content-block {
+                    margin-bottom: 8px;
+                }
+
+                .content-block-title {
+                    font-weight: bold;
+                    font-size: 12pt;
+                    margin-bottom: 3px;
+                    color: #333;
+                }
+
+                .content-block-body {
+                    line-height: 1.6;
+                    color: #333;
+                    text-indent: 2em;
+                }
+
+                .content-block-body p {
+                    margin-bottom: 3px;
+                    text-indent: 2em;
+                }
+
+                .page-number {
+                    text-align: center;
+                    color: #666;
+                    font-size: 11px;
+                    margin-top: 4px;
+                    padding-top: 4px;
+                    border-top: 1px solid #ddd;
+                    height: 24px;
+                    line-height: 16px;
+                }
+
+                .print-btn {
+                    position: fixed;
+                    top: 20px;
+                    right: 20px;
+                    padding: 10px 25px;
+                    background: #333;
+                    color: white;
+                    border: none;
+                    border-radius: 4px;
+                    cursor: pointer;
+                    font-size: 14px;
+                    transition: background 0.3s;
+                }
+
+                .print-btn:hover {
+                    background: #555;
+                }
+
+                @media print {
+                    body {
+                        background: white;
+                        padding: 0;
+                    }
+
+                    .page {
+                        width: 210mm;
+                        height: 297mm;
+                        box-shadow: none;
+                        padding: 15mm 20mm 10mm 20mm;
+                        margin: 0;
+                        page-break-after: always;
+                        overflow: hidden;
+                    }
+
+                    .page:last-child {
+                        page-break-after: auto;
+                    }
+
+                    .print-btn {
+                        display: none;
+                    }
+
+                    .info-table input[type="text"],
+                    .info-table textarea,
+                    .signature-table input[type="text"] {
+                        border: none;
+                    }
+                }
+            </style>
+        </head>
+        <body>
+            <button class="print-btn" onclick="window.print()">打印 / 另存为PDF</button>
+            \(bodyContent)
+        </body>
+        </html>
+        """
+    }
+
+    // MARK: - Content Parsing
+
+    private func parseMeetingInfo(from analysis: String) -> MeetingInfo {
+        var info = MeetingInfo()
+
+        if let themeMatch = analysis.range(of: "会议主题[:：]\\s*(.+)", options: .regularExpression) {
+            let matched = String(analysis[themeMatch])
+            if let colonIndex = matched.firstIndex(of: ":") ?? matched.firstIndex(of: "：") {
+                let startIndex = matched.index(after: colonIndex)
+                info.theme = String(matched[startIndex...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+
+        if info.theme.isEmpty {
+            let lines = analysis.components(separatedBy: .newlines)
+            if let firstLine = lines.first(where: { !$0.trimmingCharacters(in: .whitespaces).isEmpty }) {
+                let cleanLine = firstLine.trimmingCharacters(in: .whitespaces)
+                if cleanLine.hasPrefix("#") {
+                    info.theme = cleanLine.replacingOccurrences(of: "#", with: "").trimmingCharacters(in: .whitespaces)
+                } else {
+                    info.theme = cleanLine
+                }
+            }
+        }
+
+        return info
+    }
+
+    private func parseContentBlocks(from analysis: String) -> ContentBlocks {
+        var blocks = ContentBlocks()
+
+        if let previousMatch = analysis.range(
+            of: "上次会议问题[\\s:：]*([\\s\\S]*?)(?=本次会议内容[\\s:：]|$)",
+            options: .regularExpression
+        ) {
+            let matched = String(analysis[previousMatch])
+            if let content = extractContentAfterMarker(matched, markers: ["上次会议问题", ":", "："]) {
+                blocks.previousIssues = content.isEmpty ? "无" : content
+            }
+        }
+
+        if let currentMatch = analysis.range(
+            of: "本次会议内容[\\s:：]*([\\s\\S]*?)(?=本次会议决议[\\s:：]|$)",
+            options: .regularExpression
+        ) {
+            let matched = String(analysis[currentMatch])
+            if let content = extractContentAfterMarker(matched, markers: ["本次会议内容", ":", "："]) {
+                blocks.currentContent = content.isEmpty ? "（无内容）" : content
+            }
+        }
+
+        if let resolutionMatch = analysis.range(
+            of: "本次会议决议[\\s:：]*([\\s\\S]*?)(?=$)",
+            options: .regularExpression
+        ) {
+            let matched = String(analysis[resolutionMatch])
+            if let content = extractContentAfterMarker(matched, markers: ["本次会议决议", ":", "："]) {
+                blocks.resolutions = content.isEmpty ? "（无决议）" : content
+            }
+        }
+
+        if blocks.currentContent == "（无内容）" && blocks.previousIssues == "无" && blocks.resolutions == "（无决议）" {
+            blocks.currentContent = analysis.isEmpty ? "（无内容）" : analysis
+        }
+
+        return blocks
+    }
+
+    private func extractContentAfterMarker(_ text: String, markers: [String]) -> String? {
+        var remaining = text
+
+        for marker in markers {
+            if let range = remaining.range(of: marker) {
+                remaining = String(remaining[range.upperBound...])
+            }
+        }
+
+        let content = remaining.trimmingCharacters(in: .whitespacesAndNewlines)
+        return content
+    }
+
+    private func convertToParagraphs(_ text: String) -> String {
+        let lines = text.components(separatedBy: .newlines)
+        var paragraphs: [String] = []
+
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if !trimmed.isEmpty {
+                paragraphs.append("<p>\(escapeHTML(trimmed))</p>")
+            }
+        }
+
+        return paragraphs.isEmpty ? "<p>（无）</p>" : paragraphs.joined(separator: "\n                ")
+    }
+
+    private func escapeHTML(_ text: String) -> String {
+        var result = text
+        result = result.replacingOccurrences(of: "&", with: "&amp;")
+        result = result.replacingOccurrences(of: "<", with: "&lt;")
+        result = result.replacingOccurrences(of: ">", with: "&gt;")
+        result = result.replacingOccurrences(of: "\"", with: "&quot;")
+        return result
+    }
+
+    private func cleanMarkdown(_ text: String) -> String {
+        var result = text
+
+        result = result.replacingOccurrences(of: "[\\u{1F600}-\\u{1F64F}]", with: "", options: .regularExpression)
+        result = result.replacingOccurrences(of: "[\\u{1F300}-\\u{1F5FF}]", with: "", options: .regularExpression)
+        result = result.replacingOccurrences(of: "[\\u{1F680}-\\u{1F6FF}]", with: "", options: .regularExpression)
+        result = result.replacingOccurrences(of: "[\\u{2600}-\\u{26FF}]", with: "", options: .regularExpression)
+        result = result.replacingOccurrences(of: "[\\u{2700}-\\u{27BF}]", with: "", options: .regularExpression)
+        result = result.replacingOccurrences(of: "[\\u{1F900}-\\u{1F9FF}]", with: "", options: .regularExpression)
+        result = result.replacingOccurrences(of: "[\\u{1F1E0}-\\u{1F1FF}]", with: "", options: .regularExpression)
+        result = result.replacingOccurrences(of: "[\\u{FE00}-\\u{FE0F}]", with: "", options: .regularExpression)
+        result = result.replacingOccurrences(of: "[\\u{200D}]", with: "", options: .regularExpression)
+
+        result = result.replacingOccurrences(of: "^#{1,6} ", with: "", options: .regularExpression)
+        result = result.replacingOccurrences(of: "\n#{1,6} ", with: "\n", options: .regularExpression)
+
+        result = result.replacingOccurrences(of: "\\*\\*", with: "", options: .regularExpression)
+        result = result.replacingOccurrences(of: "__", with: "")
+        result = result.replacingOccurrences(of: "(?<!\\d)\\*(?!\\d)", with: "", options: .regularExpression)
+
+        result = result.replacingOccurrences(of: "```[\\s\\S]*?```", with: "", options: .regularExpression)
+        result = result.replacingOccurrences(of: "`([^`]*)`", with: "$1", options: .regularExpression)
+
+        result = result.replacingOccurrences(of: "\\[([^\\]]*)\\]\\([^\\)]*\\)", with: "$1", options: .regularExpression)
+
+        result = result.replacingOccurrences(of: "!\\[([^\\]]*)\\]\\([^\\)]*\\)", with: "", options: .regularExpression)
+
+        result = result.replacingOccurrences(of: "\\|?\\s*:?---+:?\\s*\\|?", with: "", options: .regularExpression)
+        result = result.replacingOccurrences(of: "\\|", with: "", options: .regularExpression)
+
+        result = result.replacingOccurrences(of: "^[\\s]*[-*+][\\s]", with: "", options: .regularExpression)
+        result = result.replacingOccurrences(of: "\n[\\s]*[-*+][\\s]", with: "\n", options: .regularExpression)
+
+        result = result.replacingOccurrences(of: "^[\\s]*[-*_]{3,}[\\s]*$", with: "", options: .regularExpression)
+
+        result = result.replacingOccurrences(of: "^[\\s]*> ", with: "", options: .regularExpression)
+        result = result.replacingOccurrences(of: "\n[\\s]*> ", with: "\n", options: .regularExpression)
+
+        result = result.replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
+
+        while result.contains("\n\n\n") {
+            result = result.replacingOccurrences(of: "\n\n\n", with: "\n\n")
+        }
+
+        let lines = result.components(separatedBy: "\n")
+        let trimmedLines = lines.map { $0.trimmingCharacters(in: .whitespaces) }
+        result = trimmedLines.joined(separator: "\n")
+
+        return result.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
+struct MeetingInfo {
+    var theme: String = ""
+    var host: String = ""
+    var time: String = ""
+    var location: String = ""
+    var participants: String = ""
+}
+
+struct ContentBlocks {
+    var previousIssues: String = "无"
+    var currentContent: String = "（无内容）"
+    var resolutions: String = "（无决议）"
+}
