@@ -200,30 +200,47 @@ mediamind/
 ├── mediamind/                    # 主应用代码
 │   ├── mediamindApp.swift        # 应用入口
 │   ├── Models/                   # 数据模型
-│   │   ├── AppSettings.swift     # 应用设置
+│   │   ├── AppSettings.swift     # 应用设置（含字幕语言、格式配置）
 │   │   └── TaskItem.swift        # 任务模型
 │   ├── Views/                    # UI 视图
 │   │   ├── MainView.swift        # 主视图
+│   │   ├── HomeView.swift        # 首页视图
 │   │   ├── UploadView.swift      # 上传视图
+│   │   ├── MultiUploadView.swift # 多文件上传视图
 │   │   ├── OptionsView.swift     # 选项视图
 │   │   ├── ProcessingView.swift  # 处理视图
 │   │   ├── ResultsView.swift     # 结果视图
-│   │   ├── SettingsView.swift    # 设置视图
-│   │   └── Components/           # 组件
+│   │   ├── ScreenshotView.swift  # 截图视图
+│   │   ├── SettingsView.swift    # 设置视图（字幕语言、格式设置）
+│   │   ├── TaskQueueView.swift   # 任务队列视图
+│   │   ├── SidebarView.swift     # 侧边栏视图
+│   │   └── Components/           # 可复用组件
+│   │       ├── ConfidenceIndicator.swift
+│   │       ├── GlassCard.swift
+│   │       ├── ProgressRing.swift
+│   │       ├── ServiceStatusIndicator.swift
+│   │       ├── StepIndicator.swift
+│   │       └── TemplatePickerSheet.swift
 │   ├── ViewModels/               # 视图模型
 │   │   └── TaskViewModel.swift   # 任务视图模型
 │   ├── Services/                 # 业务服务
-│   │   ├── FFmpegService.swift   # FFmpeg 服务
-│   │   ├── WhisperService.swift  # Whisper 服务
-│   │   ├── LLMService.swift      # LLM 服务
-│   │   ├── ReportService.swift   # 报告服务
-│   │   ├── TemplateService.swift # 模板服务
+│   │   ├── FFmpegService.swift   # FFmpeg 音视频处理
+│   │   ├── WhisperService.swift  # Whisper 语音转录（支持语言参数）
+│   │   ├── LLMService.swift      # LLM 内容分析
+│   │   ├── ReportService.swift   # 报告生成服务
+│   │   ├── TemplateService.swift # 模板管理服务
 │   │   ├── FileService.swift     # 文件服务
-│   │   └── ProcessingStages.swift # 处理阶段
+│   │   ├── FileProcessingCoordinator.swift # 文件处理协调器
+│   │   ├── TaskQueueManager.swift # 任务队列管理
+│   │   ├── ModelDiscoveryService.swift # 模型发现服务
+│   │   ├── ServiceHealthMonitor.swift # 服务健康监控
+│   │   ├── ResourceMonitor.swift # 资源监控
+│   │   ├── ProcessingContext.swift # 处理上下文
+│   │   └── ProcessingStages.swift # 处理阶段（字幕生成直接输出）
 │   ├── Utils/                    # 工具类
-│   │   └── Constants.swift       # 常量定义
+│   │   └── Constants.swift       # 常量定义（字幕语言列表）
 │   └── Resources/                # 资源文件
-│       └── transcribe.py         # Python 转录脚本
+│       └── transcribe.py         # Python 转录脚本（支持多语言）
 ├── mediamindTests/               # 单元测试
 ├── mediamindUITests/             # UI 测试
 ├── specs/                        # 规格文档
@@ -234,7 +251,8 @@ mediamind/
 │   ├── product.md                # 产品定位
 │   ├── structure.md              # 架构设计
 │   └── tech.md                   # 技术标准
-└── README.md                     # 项目说明
+├── README.md                     # 项目说明
+└── .gitignore                    # Git 忽略配置
 ```
 
 ### 技术栈
