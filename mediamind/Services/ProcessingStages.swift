@@ -717,36 +717,424 @@ class ReportGenerationStage: ProcessingStage {
     private func generateSubtitle(context: ProcessingContext, outputDir: URL) async throws {
         guard let transcriptionResult = context.transcriptionResult else { throw ProcessingError.transcriptionFailed }
 
-        var segments = transcriptionResult.segments
+        let targetLanguage = context.settings.subtitleTargetLanguage
 
-        if context.settings.enableBilingualSubtitle {
-            segments = try await LLMService.shared.translateSegments(
-                segments,
-                targetLanguage: context.settings.subtitleTargetLanguage,
-                settings: context.settings
+        context.reportProgress(0.87, description: "步骤1/3：复制audio.md并转换为translation.srt格式...")
+
+        let audioMDURL = outputDir.appendingPathComponent("audio.md")
+        guard FileManager.default.fileExists(atPath: audioMDURL.path) else {
+            print("[ProcessingStages] Error: audio.md not found at \(audioMDURL.path)")
+            throw ProcessingError.transcriptionFailed
+        }
+
+        let audioMDContent = try String(contentsOf: audioMDURL, encoding: .utf8)
+        let segments = parseAudioMDToSegments(audioMDContent)
+
+        print("[ProcessingStages] Parsed \(segments.count) segments from audio.md")
+
+        var srtContent = ""
+        for (index, segment) in segments.enumerated() {
+            srtContent += "\(index + 1)\n"
+            srtContent += "\(segment.startTime) --> \(segment.endTime)\n"
+            srtContent += "\(segment.text)\n\n"
+        }
+
+        let translationSRTURL = outputDir.appendingPathComponent("translation.srt")
+        try srtContent.write(to: translationSRTURL, atomically: true, encoding: .utf8)
+        print("[ProcessingStages] Step 1 completed: Created translation.srt with \(segments.count) entries")
+
+        context.reportProgress(0.90, description: "步骤2/3：使用LLM翻译为目标语言(\(targetLanguage))...")
+
+        let transcriptionSegments = segments.map { segment in
+            TranscriptionSegment(
+                startTime: segment.startTime,
+                endTime: segment.endTime,
+                speaker: "",
+                text: segment.text
             )
         }
 
-        for format in context.settings.subtitleFormats {
-            let subtitleURL = try await ReportService.shared.generateSubtitleFile(
-                segments: segments,
-                outputDir: outputDir,
-                format: format,
-                languageOrder: context.settings.subtitleLanguageOrder,
-                baseFileName: context.baseName
-            )
-            
-            if context.settings.enableBilingualSubtitle {
-                try await verifyAndFixSubtitleFile(
-                    fileURL: subtitleURL,
-                    originalSegments: transcriptionResult.segments,
-                    targetLanguage: context.settings.subtitleTargetLanguage,
-                    languageOrder: context.settings.subtitleLanguageOrder
-                )
+        let translatedSegments = try await LLMService.shared.translateSegmentsToTargetLanguage(
+            segments: transcriptionSegments,
+            targetLanguage: targetLanguage,
+            settings: context.settings
+        )
+
+        print("[ProcessingStages] Step 2 completed: Translated \(translatedSegments.count) segments to \(targetLanguage)")
+
+        var translatedSRTContent = ""
+        for (index, segment) in translatedSegments.enumerated() {
+            translatedSRTContent += "\(index + 1)\n"
+            translatedSRTContent += "\(segment.startTime) --> \(segment.endTime)\n"
+            translatedSRTContent += "\(segment.text)\n\n"
+        }
+
+        try translatedSRTContent.write(to: translationSRTURL, atomically: true, encoding: .utf8)
+        context.generatedFiles.append(translationSRTURL)
+
+        context.reportProgress(0.93, description: "步骤3/3：二次校验翻译完整性...")
+
+        try await verifyTranslationCompleteness(
+            fileURL: translationSRTURL,
+            originalSegments: segments,
+            targetLanguage: targetLanguage,
+            settings: context.settings
+        )
+
+        print("[ProcessingStages] ✅ All 3 steps completed: translation.srt generated and verified")
+    }
+
+    private struct ParsedSegment {
+        let startTime: String
+        let endTime: String
+        let text: String
+    }
+
+    private func parseAudioMDToSegments(_ content: String) -> [ParsedSegment] {
+        var segments: [ParsedSegment] = []
+        let lines = content.components(separatedBy: "\n")
+        var i = 0
+
+        while i < lines.count {
+            let line = lines[i].trimmingCharacters(in: .whitespaces)
+
+            if line.isEmpty || line.hasPrefix("#") || line.hasPrefix("---") || line.hasPrefix("*") {
+                i += 1
+                continue
             }
-            
-            context.generatedFiles.append(subtitleURL)
+
+            if let indexNum = Int(line), indexNum > 0 {
+                if i + 2 < lines.count {
+                    let timeLine = lines[i + 1].trimmingCharacters(in: .whitespaces)
+                    let textLine = lines[i + 2].trimmingCharacters(in: .whitespaces)
+
+                    if timeLine.contains("-->") {
+                        let timeParts = timeLine.components(separatedBy: " --> ")
+                        if timeParts.count == 2 {
+                            let startTime = timeParts[0].trimmingCharacters(in: .whitespaces)
+                            let endTime = timeParts[1].trimmingCharacters(in: .whitespaces)
+
+                            if !textLine.isEmpty && !textLine.hasPrefix(">") {
+                                segments.append(ParsedSegment(
+                                    startTime: startTime,
+                                    endTime: endTime,
+                                    text: textLine
+                                ))
+                            }
+                        }
+                    }
+                    i += 3
+                } else {
+                    i += 1
+                }
+            } else {
+                i += 1
+            }
         }
+
+        return segments
+    }
+
+    private func verifyTranslationCompleteness(
+        fileURL: URL,
+        originalSegments: [ParsedSegment],
+        targetLanguage: String,
+        settings: AppSettings
+    ) async throws {
+        let content = try String(contentsOf: fileURL, encoding: .utf8)
+        let entries = parseSRTFile(content)
+
+        print("[ProcessingStages] 🔍 Starting optimized verification: \(entries.count) entries, target: \(targetLanguage)")
+
+        guard entries.count == originalSegments.count else {
+            print("[ProcessingStages] ⚠️ Entry count mismatch: \(entries.count) != \(originalSegments.count)")
+            return
+        }
+
+        var level1Pass: [SubtitleEntry] = []
+        var level2Candidates: [(Int, SubtitleEntry)] = []
+
+        for (index, entry) in entries.enumerated() {
+            let originalText = originalSegments[index].text.trimmingCharacters(in: .whitespaces)
+            let currentText = entry.content.trimmingCharacters(in: .whitespaces)
+
+            if currentText.isEmpty || currentText.lowercased() == originalText.lowercased() {
+                level2Candidates.append((index, entry))
+            } else {
+                level1Pass.append(entry)
+            }
+        }
+
+        print("[ProcessingStages] Level 1 (quick): \(level1Pass.count) passed, \(level2Candidates.count) need deeper check")
+
+        var level2Pass: [SubtitleEntry] = []
+        var level3Candidates: [(Int, SubtitleEntry)] = []
+
+        for (index, entry) in level2Candidates {
+            let originalText = originalSegments[index].text.trimmingCharacters(in: .whitespaces)
+            let currentText = entry.content.trimmingCharacters(in: .whitespaces)
+
+            let hasForeignChars = containsForeignLanguageCharacters(text: currentText, targetLanguage: targetLanguage)
+            let similarity = calculateTextSimilarity(text1: currentText, text2: originalText)
+
+            if !hasForeignChars && similarity < 0.7 {
+                level2Pass.append(entry)
+            } else {
+                level3Candidates.append((index, entry))
+            }
+        }
+
+        print("[ProcessingStages] Level 2 (medium): +\(level2Pass.count) passed, \(level3Candidates.count) need deep check")
+
+        var finalEntries = level1Pass + level2Pass
+
+        if !level3Candidates.isEmpty {
+            let fixedEntries = try await batchFixProblematicEntries(
+                candidates: level3Candidates,
+                originalSegments: originalSegments,
+                targetLanguage: targetLanguage,
+                settings: settings
+            )
+            finalEntries += fixedEntries
+        }
+
+        finalEntries.sort { $0.index < $1.index }
+
+        let correctedContent = generateSRTContent(finalEntries)
+        try correctedContent.write(to: fileURL, atomically: true, encoding: .utf8)
+
+        print("[ProcessingStages] ✅ Optimized verification completed:")
+        print("[ProcessingStages]    - Total: \(entries.count)")
+        print("[ProcessingStages]    - L1 quick pass: \(level1Pass.count)")
+        print("[ProcessingStages]    - L2 medium pass: \(level2Pass.count)")
+        print("[ProcessingStages]    - L3 deep fix: \(level3Candidates.count)")
+    }
+
+    private func batchFixProblematicEntries(
+        candidates: [(Int, SubtitleEntry)],
+        originalSegments: [ParsedSegment],
+        targetLanguage: String,
+        settings: AppSettings
+    ) async throws -> [SubtitleEntry] {
+        let problematicSegments = candidates.map { (index, entry) in
+            TranscriptionSegment(
+                startTime: entry.startTime,
+                endTime: entry.endTime,
+                speaker: "",
+                text: originalSegments[index].text
+            )
+        }
+
+        let maxBatchSize = 15
+        var allFixed: [Int: SubtitleEntry] = [:]
+
+        for batchStart in stride(from: 0, to: problematicSegments.count, by: maxBatchSize) {
+            let batchEnd = min(batchStart + maxBatchSize, problematicSegments.count)
+            let batch = Array(problematicSegments[batchStart..<batchEnd])
+            let batchIndices = Array(candidates[batchStart..<batchEnd].map { $0.0 })
+
+            do {
+                let retranslated = try await LLMService.shared.translateSegmentsToTargetLanguage(
+                    segments: batch,
+                    targetLanguage: targetLanguage,
+                    settings: settings
+                )
+
+                for (localIdx, translated) in retranslated.enumerated() {
+                    let globalIdx = batchIndices[localIdx]
+                    let entry = candidates.first(where: { $0.0 == globalIdx })!.1
+                    allFixed[globalIdx] = SubtitleEntry(
+                        index: entry.index,
+                        startTime: entry.startTime,
+                        endTime: entry.endTime,
+                        content: translated.text
+                    )
+                }
+            } catch {
+                print("[ProcessingStaces] ⚠️ Batch re-translation failed, using best effort cleanup")
+                for localIdx in 0..<batch.count {
+                    let globalIdx = batchIndices[localIdx]
+                    let entry = candidates.first(where: { $0.0 == globalIdx })!.1
+                    allFixed[globalIdx] = SubtitleEntry(
+                        index: entry.index,
+                        startTime: entry.startTime,
+                        endTime: entry.endTime,
+                        content: cleanBestEffortTranslation(entry.content)
+                    )
+                }
+            }
+        }
+
+        return candidates.compactMap { (index, _) in allFixed[index] }
+    }
+
+    private func detectTranslationIssues(
+        translatedText: String,
+        originalText: String,
+        targetLanguage: String
+    ) -> [String] {
+        var issues: [String] = []
+
+        if translatedText.isEmpty {
+            issues.append("empty_translation")
+            return issues
+        }
+
+        let cleanTranslated = translatedText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanOriginal = originalText.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if cleanTranslated.lowercased() == cleanOriginal.lowercased() {
+            issues.append("not_translated_identical")
+            return issues
+        }
+
+        if cleanTranslated.contains(cleanOriginal) && cleanOriginal.count > 3 {
+            issues.append("contains_original_text")
+        }
+
+        if cleanTranslated.contains("->") || cleanTranslated.contains("→") || cleanTranslated.contains("-> ") {
+            let parts = cleanTranslated.components(separatedBy: CharacterSet(charactersIn: "->→"))
+            if parts.count >= 2 {
+                let firstPart = parts[0].trimmingCharacters(in: .whitespaces)
+                if firstPart.lowercased() == cleanOriginal.lowercased() || firstPart.count > 0 {
+                    issues.append("arrow_format_with_original")
+                }
+            }
+        }
+
+        if containsForeignLanguageCharacters(text: cleanTranslated, targetLanguage: targetLanguage) {
+            issues.append("contains_foreign_characters")
+        }
+
+        if detectMixedLanguagePattern(text: cleanTranslated) {
+            issues.append("mixed_language_pattern")
+        }
+
+        let similarity = calculateTextSimilarity(text1: cleanTranslated, text2: cleanOriginal)
+        if similarity > 0.7 {
+            issues.append("high_similarity_to_original(\(Int(similarity * 100))%)")
+        }
+
+        return issues
+    }
+
+    private func containsForeignLanguageCharacters(text: String, targetLanguage: String) -> Bool {
+        let latinChars = CharacterSet(charactersIn: "a-zA-ZàâäéèêëïîôùûüÿœæçÀÂÄÉÈÊËÏÎÔÙÛÜŸŒÆÇ")
+        let cjkChars = CharacterSet(charactersIn: "\u{4e00}-\u{9fff}\u{3400}-\u{4dbf}\u{f900}-\u{faff}\u{3040}-\u{309f}\u{30a0}-\u{30ff}")
+
+        switch targetLanguage {
+        case "Chinese":
+            var foreignCharCount = 0
+            var totalCharCount = 0
+            let whitespaceChars = CharacterSet.whitespaces
+            let punctuationChars = CharacterSet(charactersIn: "\u{FF0C}\u{3001}\u{3002}\u{FF01}\u{FF1F}\u{FF1B}\u{FF1A}\u{201C}\u{201D}\u{2018}\u{2019}\u{FF08}\u{FF09}\u{3010}\u{3011}\u{300A}\u{300B}\u{2014}\u{2026}\u{00B7}")
+
+            for char in text.unicodeScalars {
+                let isWhitespace = whitespaceChars.contains(char)
+                let isPunctuation = punctuationChars.contains(char)
+
+                if !char.isASCII && !isWhitespace && !isPunctuation {
+                    if !cjkChars.contains(char) {
+                        foreignCharCount += 1
+                    }
+                    totalCharCount += 1
+                } else if char.isASCII && !isWhitespace && char != Unicode.Scalar(44) && char != Unicode.Scalar(46) && char != Unicode.Scalar(63) && char != Unicode.Scalar(33) {
+                    let asciiStr = String(char)
+                    if asciiStr.range(of: "[a-zA-Z]", options: .regularExpression) != nil {
+                        foreignCharCount += asciiStr.count
+                        totalCharCount += asciiStr.count
+                    }
+                }
+            }
+
+            if totalCharCount > 0 {
+                let foreignRatio = Double(foreignCharCount) / Double(totalCharCount)
+                return foreignRatio > 0.15
+            }
+
+        case "English", "French", "German", "Spanish":
+            var cjkCharCount = 0
+            var totalAlphaCount = 0
+            let letterChars = CharacterSet.letters
+
+            for char in text.unicodeScalars {
+                if cjkChars.contains(char) {
+                    cjkCharCount += 1
+                }
+                if letterChars.contains(char) {
+                    totalAlphaCount += 1
+                }
+            }
+
+            if totalAlphaCount > 0 {
+                let cjkRatio = Double(cjkCharCount) / Double(totalAlphaCount)
+                return cjkRatio > 0.15
+            }
+
+        default:
+            break
+        }
+
+        return false
+    }
+
+    private func detectMixedLanguagePattern(text: String) -> Bool {
+        let patterns = [
+            "\\b(Le|La|Les|De|Des|Du|Un|Une|Et|En|Ou|Ne|Pas|Est|Sont|Avoir|Être|Pour|Dans|Sur|Avec|Sans|Chez|Par|Entre|Vers|Sous|Comme|Mais|Donc|Alors|Lorsque|Puisque|Quand|Si|Que|Qui|Ce|Cela|Ceci|Tout|Autre|Même|Bien|Plus|Très|Trop|Peu|Beaucoup|Encore|Déjà|Toujours|Jamais|Souvent|Parfois|Ici|Là|Maintenant|Aujourd\\'hui|Demain|Hier|Bonjour|Bonsoir|Merci|Excusez|S\\'il|N\\'|J\\'|L\\'|Qu\\')\\b",
+            "\\b(The|This|That|These|Those|Is|Are|Was|Were|Have|Has|Had|Will|Would|Could|Should|May|Might|Can|Shall|Must|Do|Does|Did|Not|No|Yes|And|Or|But|If|When|Where|What|Which|Who|Whom|Whose|How|Why|For|With|Without|From|To|At|In|On|By|About|Of|Over|Under|Between|Through|During|Before|After|While|Although|Though|Because|Since|Until|Unless|However|Therefore|Moreover|Furthermore|Nevertheless|Nonetheless|Otherwise|Instead|Also|Too|Very|Quite|Rather|Somewhat|Almost|Nearly|Just|Only|Even|Still|Yet|Already|Always|Never|Often|Sometimes|Here|There|Now|Then|Today|Tomorrow|Yesterday|Please|Thank|Hello|Goodbye)\\b"
+        ]
+
+        for pattern in patterns {
+            if let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) {
+                let range = NSRange(text.startIndex..., in: text)
+                let matches = regex.numberOfMatches(in: text, options: [], range: range)
+                if matches > 2 {
+                    return true
+                }
+            }
+        }
+
+        return false
+    }
+
+    private func calculateTextSimilarity(text1: String, text2: String) -> Double {
+        let words1 = Set(text1.lowercased().components(separatedBy: .whitespaces).filter { !$0.isEmpty })
+        let words2 = Set(text2.lowercased().components(separatedBy: .whitespaces).filter { !$0.isEmpty })
+
+        if words1.isEmpty || words2.isEmpty { return 0.0 }
+
+        let intersection = words1.intersection(words2)
+        let union = words1.union(words2)
+
+        return Double(intersection.count) / Double(union.count)
+    }
+
+    private func cleanBestEffortTranslation(_ text: String) -> String {
+        var cleaned = text
+
+        if cleaned.contains("->") || cleaned.contains("→") {
+            let parts = cleaned.components(separatedBy: CharacterSet(charactersIn: "->→"))
+            if parts.count >= 2 {
+                cleaned = parts.last?.trimmingCharacters(in: .whitespaces) ?? cleaned
+            }
+        }
+
+        let patternsToRemove = [
+            "^.*?->\\s*",
+            "\\(.*?\\)",
+            "\\[.*?\\]",
+            "^译文[:：]\\s*",
+            "^翻译[:：]\\s*"
+        ]
+
+        for pattern in patternsToRemove {
+            if let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) {
+                let range = NSRange(cleaned.startIndex..., in: cleaned)
+                cleaned = regex.stringByReplacingMatches(in: cleaned, options: [], range: range, withTemplate: "")
+            }
+        }
+
+        return cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private struct SubtitleEntry {
@@ -841,107 +1229,6 @@ class ReportGenerationStage: ProcessingStage {
         }
         
         return entries
-    }
-
-    private func verifyAndFixSubtitleFile(
-        fileURL: URL,
-        originalSegments: [TranscriptionSegment],
-        targetLanguage: String,
-        languageOrder: String
-    ) async throws {
-        let content = try String(contentsOf: fileURL, encoding: .utf8)
-        
-        let isVTT = fileURL.pathExtension.lowercased() == "vtt"
-        let entries: [SubtitleEntry] = isVTT ? parseVTTFile(content) : parseSRTFile(content)
-        
-        print("[ProcessingStages] Verifying subtitle file: \(fileURL.lastPathComponent), \(entries.count) entries")
-        
-        var originalTimeMap: [String: String] = [:]
-        for segment in originalSegments {
-            let key = "\(segment.startTime)_\(segment.endTime)"
-            originalTimeMap[key] = segment.text
-        }
-        
-        var fixes: [Int] = []
-        for entry in entries {
-            let key = "\(entry.startTime)_\(entry.endTime)"
-            guard let originalText = originalTimeMap[key] else { continue }
-            
-            let contentLines = entry.content.components(separatedBy: "\n").filter { !$0.isEmpty }
-            
-            if contentLines.count == 1 {
-                continue
-            }
-            
-            var hasOriginal = false
-            var hasTranslation = false
-            
-            for line in contentLines {
-                let trimmed = line.trimmingCharacters(in: .whitespaces)
-                if trimmed == originalText.trimmingCharacters(in: .whitespaces) {
-                    hasOriginal = true
-                } else {
-                    hasTranslation = true
-                }
-            }
-            
-            if hasOriginal && hasTranslation {
-                continue
-            }
-            
-            if contentLines.count == 1 {
-                fixes.append(entry.index)
-            }
-        }
-        
-        if fixes.isEmpty {
-            print("[ProcessingStages] ✅ Subtitle verification passed, all entries have both original and translation")
-            return
-        }
-        
-        print("[ProcessingStages] ⚠️ Found \(fixes.count) entries with missing translation, attempting fix...")
-        
-        var correctedEntries: [SubtitleEntry] = []
-        
-        for entry in entries {
-            let key = "\(entry.startTime)_\(entry.endTime)"
-            guard let originalText = originalTimeMap[key] else {
-                correctedEntries.append(entry)
-                continue
-            }
-            
-            let contentLines = entry.content.components(separatedBy: "\n").filter { !$0.isEmpty }
-            
-            var newContent: String
-            if contentLines.count == 1 {
-                let translated = contentLines[0].trimmingCharacters(in: .whitespaces)
-                let origTrimmed = originalText.trimmingCharacters(in: .whitespaces)
-                
-                if translated != origTrimmed {
-                    newContent = languageOrder == "en-cn"
-                        ? "\(originalText)\n\(translated)"
-                        : "\(translated)\n\(originalText)"
-                } else {
-                    newContent = entry.content
-                }
-            } else {
-                newContent = entry.content
-            }
-            
-            correctedEntries.append(SubtitleEntry(
-                index: entry.index,
-                startTime: entry.startTime,
-                endTime: entry.endTime,
-                content: newContent
-            ))
-        }
-        
-        let correctedContent = isVTT
-            ? generateVTTContent(correctedEntries)
-            : generateSRTContent(correctedEntries)
-        
-        try correctedContent.write(to: fileURL, atomically: true, encoding: .utf8)
-        print("[ProcessingStages] ✅ Subtitle file corrected and saved")
     }
 
     private func generateSRTContent(_ entries: [SubtitleEntry]) -> String {

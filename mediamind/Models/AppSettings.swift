@@ -10,10 +10,7 @@ final class AppSettings {
     var enableVAD: Bool
     var enableSpeakerDiarization: Bool
     var enableVolumeNormalize: Bool
-    var enableBilingualSubtitle: Bool
-    var subtitleLanguageOrder: String
     var subtitleTargetLanguage: String
-    var subtitleFormats: [String]
     var llmService: String
     var llmModel: String
     var llmBaseURL: String
@@ -126,10 +123,7 @@ final class AppSettings {
         enableVAD: Bool = true,
         enableSpeakerDiarization: Bool = false,
         enableVolumeNormalize: Bool = true,
-        enableBilingualSubtitle: Bool = true,
-        subtitleLanguageOrder: String = "cn-en",
         subtitleTargetLanguage: String = "Chinese",
-        subtitleFormats: [String] = ["SRT", "VTT"],
         llmService: String = "",
         llmModel: String = "",
         llmBaseURL: String = "",
@@ -153,10 +147,7 @@ final class AppSettings {
         self.enableVAD = enableVAD
         self.enableSpeakerDiarization = enableSpeakerDiarization
         self.enableVolumeNormalize = enableVolumeNormalize
-        self.enableBilingualSubtitle = enableBilingualSubtitle
-        self.subtitleLanguageOrder = subtitleLanguageOrder
         self.subtitleTargetLanguage = subtitleTargetLanguage
-        self.subtitleFormats = subtitleFormats
         self.llmService = llmService
         self.llmModel = llmModel
         self.llmBaseURL = llmBaseURL

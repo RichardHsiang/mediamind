@@ -40,11 +40,11 @@ struct LLMService {
     func translateSegments(_ segments: [TranscriptionSegment], targetLanguage: String, settings: AppSettings) async throws -> [TranscriptionSegment] {
         let batchSize = 20
         var allTranslatedTexts: [String] = []
-        
+
         for batchStart in stride(from: 0, to: segments.count, by: batchSize) {
             let batchEnd = min(batchStart + batchSize, segments.count)
             let batchSegments = Array(segments[batchStart..<batchEnd])
-            
+
             var translatedDict = try await translateBatchWithVerification(
                 batchSegments: batchSegments,
                 batchOffset: batchStart,
@@ -52,7 +52,7 @@ struct LLMService {
                 settings: settings,
                 maxRetries: 2
             )
-            
+
             for i in batchStart..<batchEnd {
                 if let translated = translatedDict[i] {
                     allTranslatedTexts.append(translated)
@@ -62,28 +62,221 @@ struct LLMService {
                 }
             }
         }
-        
+
         var result: [TranscriptionSegment] = []
         for (index, segment) in segments.enumerated() {
             let translatedText = index < allTranslatedTexts.count ? allTranslatedTexts[index] : segment.text
-            
-            let combinedText: String
-            if settings.subtitleLanguageOrder == "en-cn" {
-                combinedText = "\(segment.text)\n\(translatedText)"
-            } else {
-                combinedText = "\(translatedText)\n\(segment.text)"
-            }
-            
+
             result.append(TranscriptionSegment(
                 startTime: segment.startTime,
                 endTime: segment.endTime,
                 speaker: segment.speaker,
-                text: combinedText
+                text: translatedText
             ))
         }
-        
-        print("[LLMService] ✅ Subtitle translation and verification completed for \(segments.count) segments")
+
+        print("[LLMService] ✅ Subtitle translation completed for \(segments.count) segments (target language only)")
         return result
+    }
+
+    func translateSegmentsToTargetLanguage(
+        segments: [TranscriptionSegment],
+        targetLanguage: String,
+        settings: AppSettings
+    ) async throws -> [TranscriptionSegment] {
+        let (needsTranslation, skipIndices) = preFilterSegments(segments, targetLanguage: targetLanguage)
+        print("[LLMService] 📊 Pre-filter: \(segments.count) total, \(needsTranslation.count) need translation, \(skipIndices.count) skipped")
+
+        if needsTranslation.isEmpty {
+            return segments
+        }
+
+        let batchSize = 30
+        let maxConcurrency = min(4, (needsTranslation.count + batchSize - 1) / batchSize)
+        var allTranslatedTexts: [(Int, String)] = []
+
+        try await withThrowingTaskGroup(of: (Int, [Int: String]).self) { group in
+            var batchIndex = 0
+            for batchStart in stride(from: 0, to: needsTranslation.count, by: batchSize) {
+                let batchEnd = min(batchStart + batchSize, needsTranslation.count)
+                let batchSegments = Array(needsTranslation[batchStart..<batchEnd])
+                let originalIndices = Array((batchStart..<batchEnd).map { needsTranslation[$0].originalIndex })
+                let currentBatchIndex = batchIndex
+
+                if currentBatchIndex < maxConcurrency {
+                    group.addTask {
+                        let dict = try await self.translateBatchWithVerification(
+                            batchSegments: batchSegments.map { TranscriptionSegment(startTime: $0.segment.startTime, endTime: $0.segment.endTime, speaker: $0.segment.speaker, text: $0.segment.text) },
+                            batchOffset: originalIndices.first ?? 0,
+                            targetLanguage: targetLanguage,
+                            settings: settings,
+                            maxRetries: 2
+                        )
+                        return (currentBatchIndex, dict)
+                    }
+                } else {
+                    let dict = try await self.translateBatchWithVerification(
+                        batchSegments: batchSegments.map { TranscriptionSegment(startTime: $0.segment.startTime, endTime: $0.segment.endTime, speaker: $0.segment.speaker, text: $0.segment.text) },
+                        batchOffset: originalIndices.first ?? 0,
+                        targetLanguage: targetLanguage,
+                        settings: settings,
+                        maxRetries: 2
+                    )
+                    for idx in originalIndices {
+                        allTranslatedTexts.append((idx, dict[idx] ?? ""))
+                    }
+                }
+
+                batchIndex += 1
+            }
+
+            var batchResults: [(Int, [Int: String])] = []
+            for try await result in group {
+                batchResults.append(result)
+            }
+            batchResults.sort { $0.0 < $1.0 }
+
+            for (_, dict) in batchResults {
+                for (idx, text) in dict {
+                    allTranslatedTexts.append((idx, text))
+                }
+            }
+        }
+
+        allTranslatedTexts.sort { $0.0 < $1.0 }
+
+        var translatedMap: [Int: String] = [:]
+        for (idx, text) in allTranslatedTexts {
+            translatedMap[idx] = text
+        }
+
+        var result: [TranscriptionSegment] = []
+        for (index, segment) in segments.enumerated() {
+            if skipIndices.contains(index) {
+                result.append(segment)
+            } else if let translated = translatedMap[index] {
+                result.append(TranscriptionSegment(
+                    startTime: segment.startTime,
+                    endTime: segment.endTime,
+                    speaker: segment.speaker,
+                    text: translated.isEmpty ? segment.text : translated
+                ))
+            } else {
+                result.append(segment)
+            }
+        }
+
+        print("[LLMService] ✅ Parallel translation completed for \(segments.count) segments (\(maxConcurrency) concurrent batches)")
+        return result
+    }
+
+    private struct FilteredSegment {
+        let originalIndex: Int
+        let segment: TranscriptionSegment
+    }
+
+    private func preFilterSegments(_ segments: [TranscriptionSegment], targetLanguage: String) -> (needsTranslation: [FilteredSegment], skipIndices: Set<Int>) {
+        var needsTranslation: [FilteredSegment] = []
+        var skipIndices: Set<Int> = []
+
+        let numberPattern = try? NSRegularExpression(pattern: "^[\\d\\s\\.,\\-+]+$", options: [])
+        let punctuationOnly = CharacterSet(charactersIn: "\u{FF0C}\u{3001}\u{3002}\u{FF01}\u{FF1F}\u{FF1B}\u{FF1A}\u{201C}\u{201D}\u{2018}\u{2019}\u{FF08}\u{FF09}\u{3010}\u{3011}\u{300A}\u{300B}\u{2014}\u{2026}\u{00B7},.?!;:'\"()-_")
+
+        for (index, segment) in segments.enumerated() {
+            let trimmed = segment.text.trimmingCharacters(in: .whitespacesAndNewlines)
+
+            if trimmed.isEmpty {
+                skipIndices.insert(index)
+                continue
+            }
+
+            if trimmed.count <= 2 && trimmed.range(of: "[\\d\\.,]", options: .regularExpression) != nil {
+                skipIndices.insert(index)
+                continue
+            }
+
+            if let pattern = numberPattern, let match = pattern.firstMatch(in: trimmed, range: NSRange(trimmed.startIndex..., in: trimmed)) {
+                if match.range.length == trimmed.count {
+                    skipIndices.insert(index)
+                    continue
+                }
+            }
+
+            var isPunctuationOnly = true
+            let letterChars = CharacterSet.letters
+            for char in trimmed.unicodeScalars {
+                if !char.isASCII && !punctuationOnly.contains(char) && char != Unicode.Scalar(32) {
+                    isPunctuationOnly = false
+                    break
+                }
+                if char.isASCII && letterChars.contains(char) {
+                    isPunctuationOnly = false
+                    break
+                }
+            }
+            if isPunctuationOnly && trimmed.count > 0 {
+                skipIndices.insert(index)
+                continue
+            }
+
+            needsTranslation.append(FilteredSegment(originalIndex: index, segment: segment))
+        }
+
+        return (needsTranslation, skipIndices)
+    }
+
+    func translateSingleText(text: String, targetLanguage: String, settings: AppSettings) async throws -> String {
+        let prompt = """
+【字幕翻译任务】
+
+目标语言：\(targetLanguage)
+
+【严格要求】
+1. 将以下文本完整翻译为\(targetLanguage)
+2. 绝对不能保留任何原始语言的词汇、短语或字符
+3. 禁止输出类似"原文 -> 译文"的格式
+4. 禁止在译文中夹杂原文（包括括号注释）
+5. 只输出纯\(targetLanguage)翻译结果
+
+待翻译文本：
+\(text)
+
+请直接输出翻译结果（不要添加任何解释）：
+"""
+
+        let serviceType = LLMServiceType(rawValue: settings.llmService) ?? .ollama
+        let baseURL = settings.llmBaseURL.isEmpty ? serviceType.defaultBaseURL : settings.llmBaseURL
+
+        let translation: String
+        switch serviceType {
+        case .ollama:
+            translation = try await callOllama(baseURL: baseURL, model: settings.llmModel, prompt: prompt)
+        case .lmstudio:
+            translation = try await callLMStudio(baseURL: baseURL, model: settings.llmModel, prompt: prompt)
+        }
+
+        var cleanedTranslation = translation.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        cleanedTranslation = removeOriginalLanguageResidue(from: cleanedTranslation, original: text)
+
+        print("[LLMService] ✅ Single text translation completed")
+        return cleanedTranslation
+    }
+
+    private func removeOriginalLanguageResidue(from translated: String, original: String) -> String {
+        var cleaned = translated
+
+        if cleaned.contains("->") || cleaned.contains("→") || cleaned.contains("-> ") {
+            let parts = cleaned.components(separatedBy: CharacterSet(charactersIn: "->→"))
+            if parts.count >= 2 {
+                let lastPart = parts.last?.trimmingCharacters(in: .whitespaces) ?? ""
+                if !lastPart.isEmpty && lastPart.lowercased() != original.lowercased() {
+                    cleaned = lastPart
+                }
+            }
+        }
+
+        return cleaned
     }
     
     private func translateBatchWithVerification(
@@ -103,26 +296,50 @@ struct LLMService {
             let prompt: String
             if attempt == 0 {
                 prompt = """
-请将以下带编号的文本逐行翻译为\(targetLanguage)。严格保持编号格式和行数对应关系，每行必须以 [编号] 开头，编号与原文完全一致。不要合并、拆分或跳过任何行。
+【字幕批量翻译任务】
 
+目标语言：\(targetLanguage)
+
+【核心要求 - 必须严格遵守】
+1. 将以下每一行文本完整翻译为纯\(targetLanguage)
+2. 绝对禁止保留任何原始语言的词汇、字符或短语
+3. 禁止输出"原文 -> 译文"或"原文（译文）"格式
+4. 每行必须以 [编号] 开头，编号与原文完全一致
+5. 不要合并、拆分或跳过任何行
+6. 翻译结果必须是纯净的\(targetLanguage)文本，不能夹杂任何其他语言
+
+【示例说明】
+如果原文是法语，目标是中文：
+❌ 错误：[0] Le polonier -> 波洛尼耶（保留了法文）
+✅ 正确：[0] 波洛尼耶（完全翻译）
+
+如果原文是英文，目标是中文：
+❌ 错误：[0] Hello world -> 你好世界（格式错误）
+✅ 正确：[0] 你好世界
+
+待翻译文本（共 \(expectedCount) 行）：
 \(indexedTexts)
+
+请逐行输出翻译结果，每行格式为 [编号] 译文：
 """
             } else {
                 prompt = """
-【重要：请严格按照要求输出，这是第 \(attempt + 1) 次重试】
+【严重警告：前次翻译未通过校验，这是第 \(attempt + 1)/\(maxRetries + 1) 次重试】
 
-任务：将以下文本逐行翻译为\(targetLanguage)
+【上次失败原因】
+检测到翻译结果中仍包含原始语言内容或格式不符合要求
 
-严格要求：
-1. 必须输出恰好 \(expectedCount) 行翻译结果
-2. 每行格式必须是：[编号] 翻译内容
-3. 编号从 \(batchOffset) 开始，连续递增到 \(batchOffset + expectedCount - 1)
-4. 绝对不能遗漏、合并或拆分任何一行
+【本次必须做到】
+1. 输出恰好 \(expectedCount) 行翻译结果
+2. 每行格式：[编号] 纯\(targetLanguage)译文
+3. 编号从 \(batchOffset) 到 \(batchOffset + expectedCount - 1)，连续不跳跃
+4. 每一行都必须是100%的\(targetLanguage)，不能有任何一个外文字符
+5. 绝对禁止：原文残留、混合语言、括号注释、箭头标记
 
-原始文本：
+原始文本（共 \(expectedCount) 行）：
 \(indexedTexts)
 
-请直接输出翻译结果，每行一个：
+请直接输出纯净的翻译结果：
 """
             }
             

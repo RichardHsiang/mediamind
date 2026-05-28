@@ -43,7 +43,7 @@ enum OutputType: String, CaseIterable, Identifiable {
 
     var description: String {
         switch self {
-        case .subtitle: return "生成SRT、VTT、ASS格式字幕文件，支持双语字幕"
+        case .subtitle: return "生成SRT格式翻译字幕文件，支持多语言翻译"
         case .analysis: return "AI智能提取核心知识点、时间线、操作步骤"
         case .report: return "生成专业HTML报告，包含摘要、行动项、时间线"
         }
@@ -67,7 +67,7 @@ enum OutputType: String, CaseIterable, Identifiable {
 
     var tags: [String] {
         switch self {
-        case .subtitle: return ["SRT", "VTT", "双语"]
+        case .subtitle: return ["SRT", "翻译", "单语"]
         case .analysis: return ["结构化", "时间线", "Markdown"]
         case .report: return ["HTML", "模板化", "可视化"]
         }
@@ -75,7 +75,7 @@ enum OutputType: String, CaseIterable, Identifiable {
 
     var outputFiles: [String] {
         switch self {
-        case .subtitle: return ["subtitles.srt", "subtitles_bilingual.srt"]
+        case .subtitle: return ["translation.srt"]
         case .analysis: return ["audio_analysis.md"]
         case .report: return ["meeting_report.html"]
         }
@@ -233,8 +233,6 @@ struct AppConstants {
     static let maxFileSize: Int64 = 2 * 1024 * 1024 * 1024 // 2GB
 
     static let whisperModels = ["tiny", "base", "small", "medium", "large"]
-    static let subtitleOrders = ["cn-en", "en-cn"]
-    static let subtitleOrderDisplayNames = ["中文在上，英文在下", "英文在上，中文在下"]
     static let subtitleTargetLanguages = ["Chinese", "English", "Japanese", "Korean", "French", "German", "Spanish"]
     static let subtitleTargetLanguageDisplayNames = ["中文", "英文", "日文", "韩文", "法文", "德文", "西班牙文"]
 }

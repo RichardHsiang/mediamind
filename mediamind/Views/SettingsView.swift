@@ -305,38 +305,6 @@ struct SettingsView: View {
                 // Subtitle Settings
                 settingsSection(title: "字幕生成设置", icon: "captions.bubble", color: .appleOrange) {
                     VStack(spacing: 16) {
-                        ToggleRow(
-                            title: "生成双语字幕",
-                            description: "同时生成原始语言和目标语言字幕",
-                            isOn: Binding(
-                                get: { settings.enableBilingualSubtitle },
-                                set: {
-                                    settings.enableBilingualSubtitle = $0
-                                    autoSave()
-                                }
-                            )
-                        )
-                        
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text("字幕语言顺序")
-                                .font(.system(size: 14, weight: .medium))
-                            
-                            Picker("", selection: Binding(
-                                get: { settings.subtitleLanguageOrder },
-                                set: {
-                                    settings.subtitleLanguageOrder = $0
-                                    autoSave()
-                                }
-                            )) {
-                                ForEach(0..<AppConstants.subtitleOrders.count, id: \.self) { index in
-                                    Text(AppConstants.subtitleOrderDisplayNames[index])
-                                        .tag(AppConstants.subtitleOrders[index])
-                                }
-                            }
-                            .pickerStyle(MenuPickerStyle())
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                        
                         VStack(alignment: .leading, spacing: 8) {
                             Text("目标语言")
                                 .font(.system(size: 14, weight: .medium))
@@ -357,21 +325,9 @@ struct SettingsView: View {
                             .frame(maxWidth: .infinity, alignment: .leading)
                         }
                         
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text("字幕格式")
-                                .font(.system(size: 14, weight: .medium))
-                            
-                            HStack(spacing: 16) {
-                                ForEach(["SRT", "VTT", "ASS"], id: \.self) { format in
-                                    FormatCheckbox(
-                                        title: format,
-                                        isSelected: settings.subtitleFormats.contains(format)
-                                    ) {
-                                        toggleSubtitleFormat(format)
-                                    }
-                                }
-                            }
-                        }
+                        Text("字幕格式：SRT（自动生成翻译后的单语字幕文件 translation.srt）")
+                            .font(.system(size: 12))
+                            .foregroundColor(.appleGray)
                     }
                 }
                 
@@ -939,17 +895,6 @@ struct SettingsView: View {
     }
     
     private func saveSettings() {
-        autoSave()
-    }
-    
-    private func toggleSubtitleFormat(_ format: String) {
-        var formats = settings.subtitleFormats
-        if formats.contains(format) {
-            formats.removeAll { $0 == format }
-        } else {
-            formats.append(format)
-        }
-        settings.subtitleFormats = formats
         autoSave()
     }
     
