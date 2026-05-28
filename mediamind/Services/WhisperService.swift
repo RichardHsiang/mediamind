@@ -421,7 +421,6 @@ struct WhisperService {
 
         // 检查常见的开发路径
         let possiblePaths = [
-            "\(NSHomeDirectory())/Documents/obsidian仓库/trae/mediamind/mediamind/Resources/transcribe.py",
             "\(NSHomeDirectory())/Documents/trae/mediamind/mediamind/Resources/transcribe.py",
         ]
 
@@ -810,7 +809,6 @@ struct WhisperService {
 
         // 检查常见的开发路径
         let possiblePaths = [
-            "\(NSHomeDirectory())/Documents/obsidian仓库/trae/mediamind/mediamind/Resources/transcribe.py",
             "\(NSHomeDirectory())/Documents/trae/mediamind/mediamind/Resources/transcribe.py",
         ]
 

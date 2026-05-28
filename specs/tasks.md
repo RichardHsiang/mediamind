@@ -24,7 +24,7 @@
 - [ ] Step 1.1: 在 Xcode 中创建 Group 目录结构
   **VALIDATION GATE**:
   - Type: FileCheck
-  - Command: `ls -la /Users/richardhsiang/Documents/obsidian仓库/trae/mediamind/mediamind/`
+  - Command: `ls -la <project_root>/mediamind/`
   - Expected: 包含 Models, Views, ViewModels, Services, Utils 目录
   - Pass Criteria: 所有目录存在
   - Fail Action: 重新创建缺失目录
@@ -32,7 +32,7 @@
 - [ ] Step 1.2: 移动现有文件到正确位置
   **VALIDATION GATE**:
   - Type: Compilation
-  - Command: `cd /Users/richardhsiang/Documents/obsidian仓库/trae/mediamind && xcodebuild -project mediamind.xcodeproj -scheme mediamind -destination 'platform=macOS' clean build`
+  - Command: `cd <project_root> && xcodebuild -project mediamind.xcodeproj -scheme mediamind -destination 'platform=macOS' clean build`
   - Expected: BUILD SUCCEEDED
   - Pass Criteria: 编译成功，无错误
   - Fail Action: 检查文件引用路径
