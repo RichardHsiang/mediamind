@@ -347,14 +347,12 @@ class ReportGenerationStage: ProcessingStage {
         let finalOutputDir = URL(fileURLWithPath: currentOutputPath.replacingOccurrences(of: "~", with: NSHomeDirectory()))
         try FileManager.default.createDirectory(at: finalOutputDir, withIntermediateDirectories: true)
 
-        let taskOutputDir: URL
-        switch context.outputType {
-        case .subtitle:
-            taskOutputDir = finalOutputDir
-        case .analysis, .report:
-            taskOutputDir = finalOutputDir.appendingPathComponent(context.baseName)
-            try FileManager.default.createDirectory(at: taskOutputDir, withIntermediateDirectories: true)
-        }
+        // 所有输出类型都创建同名文件夹
+        let taskOutputDir = finalOutputDir.appendingPathComponent(context.baseName)
+        try FileManager.default.createDirectory(at: taskOutputDir, withIntermediateDirectories: true)
+        
+        // 将原始音视频文件移动到同名文件夹中
+        try await moveOriginalFileToOutputDir(context: context, outputDir: taskOutputDir)
 
         context.reportProgress(0.85, description: "生成原始转录文本...")
         try await generateAudioMD(context: context, outputDir: taskOutputDir)
@@ -375,6 +373,26 @@ class ReportGenerationStage: ProcessingStage {
         try await generateMetadata(context: context, outputDir: taskOutputDir)
 
         context.reportProgress(1.0, description: "处理完成")
+    }
+
+    private func moveOriginalFileToOutputDir(context: ProcessingContext, outputDir: URL) async throws {
+        let fileName = context.fileName
+        let destinationURL = outputDir.appendingPathComponent(fileName)
+        
+        // 如果文件已经在目标目录中，不需要移动
+        if context.fileURL.deletingLastPathComponent() == outputDir {
+            print("[ReportGenerationStage] File already in output directory")
+            return
+        }
+        
+        // 如果目标位置已存在同名文件，先删除
+        if FileManager.default.fileExists(atPath: destinationURL.path) {
+            try FileManager.default.removeItem(at: destinationURL)
+        }
+        
+        // 移动文件到输出目录
+        try FileManager.default.moveItem(at: context.fileURL, to: destinationURL)
+        print("[ReportGenerationStage] Moved original file to: \(destinationURL.path)")
     }
 
     private func generateAudioMD(context: ProcessingContext, outputDir: URL) async throws {
@@ -736,7 +754,10 @@ class ReportGenerationStage: ProcessingStage {
         for (index, segment) in segments.enumerated() {
             srtContent += "\(index + 1)\n"
             srtContent += "\(segment.startTime) --> \(segment.endTime)\n"
-            srtContent += "\(segment.text)\n\n"
+            // 清理并自动换行：保持每行字数在18-25字之间，最多两行
+            let cleanedText = cleanSubtitleText(segment.text)
+            let wrappedText = wrapSubtitleText(cleanedText, minChars: 18, maxChars: 25)
+            srtContent += "\(wrappedText)\n\n"
         }
 
         let translationSRTURL = outputDir.appendingPathComponent("translation.srt")
@@ -766,7 +787,10 @@ class ReportGenerationStage: ProcessingStage {
         for (index, segment) in translatedSegments.enumerated() {
             translatedSRTContent += "\(index + 1)\n"
             translatedSRTContent += "\(segment.startTime) --> \(segment.endTime)\n"
-            translatedSRTContent += "\(segment.text)\n\n"
+            // 清理翻译结果并自动换行：保持每行字数在18-25字之间，最多两行
+            let cleanedText = cleanSubtitleText(segment.text)
+            let wrappedText = wrapSubtitleText(cleanedText, minChars: 18, maxChars: 25)
+            translatedSRTContent += "\(wrappedText)\n\n"
         }
 
         try translatedSRTContent.write(to: translationSRTURL, atomically: true, encoding: .utf8)
@@ -804,9 +828,8 @@ class ReportGenerationStage: ProcessingStage {
             }
 
             if let indexNum = Int(line), indexNum > 0 {
-                if i + 2 < lines.count {
+                if i + 1 < lines.count {
                     let timeLine = lines[i + 1].trimmingCharacters(in: .whitespaces)
-                    let textLine = lines[i + 2].trimmingCharacters(in: .whitespaces)
 
                     if timeLine.contains("-->") {
                         let timeParts = timeLine.components(separatedBy: " --> ")
@@ -814,16 +837,38 @@ class ReportGenerationStage: ProcessingStage {
                             let startTime = timeParts[0].trimmingCharacters(in: .whitespaces)
                             let endTime = timeParts[1].trimmingCharacters(in: .whitespaces)
 
-                            if !textLine.isEmpty && !textLine.hasPrefix(">") {
+                            // 收集多行文本，直到遇到空行或下一个序号
+                            var textLines: [String] = []
+                            var j = i + 2
+                            while j < lines.count {
+                                let nextLine = lines[j].trimmingCharacters(in: .whitespaces)
+                                if nextLine.isEmpty {
+                                    break
+                                }
+                                if let _ = Int(nextLine), nextLine == String(j - i - 2 + 1) {
+                                    // 可能是下一个序号
+                                    break
+                                }
+                                if nextLine.hasPrefix("#") || nextLine.hasPrefix("---") || nextLine.hasPrefix("*") || nextLine.hasPrefix(">") {
+                                    break
+                                }
+                                textLines.append(lines[j])
+                                j += 1
+                            }
+
+                            let text = textLines.joined(separator: "\n")
+                            if !text.isEmpty {
                                 segments.append(ParsedSegment(
                                     startTime: startTime,
                                     endTime: endTime,
-                                    text: textLine
+                                    text: text
                                 ))
                             }
+                            i = j
+                            continue
                         }
                     }
-                    i += 3
+                    i += 1
                 } else {
                     i += 1
                 }
@@ -1320,5 +1365,182 @@ class ReportGenerationStage: ProcessingStage {
             try? metadataData.write(to: metadataURL)
             context.generatedFiles.append(metadataURL)
         }
+    }
+    
+    /// 清理字幕文本，移除可能存在的非字幕内容（如 [x] 序号、括号注释等）
+    private func cleanSubtitleText(_ text: String) -> String {
+        var cleaned = text
+        
+        // 1. 移除首尾的方括号序号，如 "[0]"、"[1]" 等
+        let bracketIndexPattern = "^\\[\\d+\\]\\s*"
+        if let regex = try? NSRegularExpression(pattern: bracketIndexPattern) {
+            let range = NSRange(cleaned.startIndex..., in: cleaned)
+            cleaned = regex.stringByReplacingMatches(in: cleaned, options: [], range: range, withTemplate: "")
+        }
+        
+        // 2. 移除首尾引号
+        if (cleaned.hasPrefix("\"") && cleaned.hasSuffix("\"")) || (cleaned.hasPrefix("'") && cleaned.hasSuffix("'")) {
+            cleaned = String(cleaned.dropFirst().dropLast())
+        }
+        
+        // 3. 移除常见的 LLM 误加的标记和注释
+        let noisePatterns = [
+            "^序号[:：]\\s*\\d+\\s*",
+            "^译文[:：]\\s*",
+            "^翻译[:：]\\s*",
+            "^结果[:：]\\s*",
+            "\\(.*?翻译.*?\\)",
+            "译文[:：].*$"
+        ]
+        
+        for pattern in noisePatterns {
+            if let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) {
+                let range = NSRange(cleaned.startIndex..., in: cleaned)
+                cleaned = regex.stringByReplacingMatches(in: cleaned, options: [], range: range, withTemplate: "")
+            }
+        }
+        
+        // 4. 移除行首可能误加的数字序号（如 "1. 内容"）
+        let leadingNumberPattern = "^\\d+[\\.、\\s]+"
+        if let regex = try? NSRegularExpression(pattern: leadingNumberPattern) {
+            let range = NSRange(cleaned.startIndex..., in: cleaned)
+            cleaned = regex.stringByReplacingMatches(in: cleaned, options: [], range: range, withTemplate: "")
+        }
+        
+        return cleaned.trimmingCharacters(in: .whitespaces)
+    }
+    
+    /// 字幕文本自动换行，最多只分为上下两行，保持每行字数相当（18-25字之间）
+    /// - 标点符号不允许单独占据一行
+    private func wrapSubtitleText(_ text: String, minChars: Int = 18, maxChars: Int = 25) -> String {
+        // 如果文本已经包含换行符，说明已经格式化过，直接返回
+        if text.contains("\n") {
+            return text
+        }
+        
+        // 清理文本：去除首尾空白
+        let trimmed = text.trimmingCharacters(in: .whitespaces)
+        
+        // 如果文本长度小于等于最大字符数，不需要换行
+        if trimmed.count <= maxChars {
+            return trimmed
+        }
+        
+        // 标点符号集合（用于断行，但不能单独成行）
+        let breakPunctuation: Set<Character> = ["，", "、", "；", "：", ",", ";", ":", " "]
+        let endPunctuation: Set<Character> = ["。", "！", "？", ".", "!", "?"]
+        
+        // 尝试找到最佳的断行位置
+        // 目标：断在 minChars 到 maxChars 之间，且断点后的字符不是标点
+        let totalLength = trimmed.count
+        let idealBreakPos = totalLength / 2 // 理想断点位置（中间）
+        
+        // 搜索范围：在 idealBreakPos ± 一定的范围内寻找最佳断点
+        let searchStart = max(minChars, idealBreakPos - 5)
+        let searchEnd = min(maxChars, totalLength - minChars)
+        
+        // 如果总长度超过两行最大限制（50字），则强制断在 maxChars 处
+        if totalLength > maxChars * 2 {
+            return forceWrapTwoLines(trimmed, maxChars: maxChars, breakPunctuation: breakPunctuation, endPunctuation: endPunctuation)
+        }
+        
+        // 在搜索范围内寻找最佳断点
+        var bestBreakIndex: String.Index? = nil
+        var bestScore = Int.max
+        
+        let searchStartIndex = trimmed.index(trimmed.startIndex, offsetBy: searchStart)
+        let searchEndIndex = trimmed.index(trimmed.startIndex, offsetBy: searchEnd)
+        
+        var currentIndex = searchStartIndex
+        while currentIndex <= searchEndIndex {
+            let char = trimmed[currentIndex]
+            if breakPunctuation.contains(char) {
+                // 检查断点后的字符是否不是标点
+                let nextIndex = trimmed.index(after: currentIndex)
+                if nextIndex < trimmed.endIndex {
+                    let nextChar = trimmed[nextIndex]
+                    if !breakPunctuation.contains(nextChar) && !endPunctuation.contains(nextChar) {
+                        // 计算评分：越接近理想断点位置越好
+                        let distance = abs(trimmed.distance(from: trimmed.startIndex, to: currentIndex) - idealBreakPos)
+                        if distance < bestScore {
+                            bestScore = distance
+                            bestBreakIndex = trimmed.index(after: currentIndex) // 断在标点之后
+                        }
+                    }
+                }
+            }
+            currentIndex = trimmed.index(after: currentIndex)
+        }
+        
+        // 如果没找到合适的标点断点，在 maxChars 附近的空格处断行
+        if bestBreakIndex == nil {
+            currentIndex = searchStartIndex
+            while currentIndex <= searchEndIndex {
+                let char = trimmed[currentIndex]
+                if char == " " {
+                    bestBreakIndex = trimmed.index(after: currentIndex)
+                    break
+                }
+                currentIndex = trimmed.index(after: currentIndex)
+            }
+        }
+        
+        // 如果还是没有找到合适的断点，在中间位置强制断行
+        if bestBreakIndex == nil {
+            let midPos = totalLength / 2
+            bestBreakIndex = trimmed.index(trimmed.startIndex, offsetBy: midPos)
+        }
+        
+        // 生成分行结果
+        if let breakIdx = bestBreakIndex {
+            let firstLine = String(trimmed[..<breakIdx]).trimmingCharacters(in: .whitespaces)
+            let secondLine = String(trimmed[breakIdx...]).trimmingCharacters(in: .whitespaces)
+            
+            // 检查第二行是否以标点开头，如果是则调整
+            var adjustedFirstLine = firstLine
+            var adjustedSecondLine = secondLine
+            
+            if let firstChar = secondLine.first {
+                if breakPunctuation.contains(firstChar) || endPunctuation.contains(firstChar) {
+                    // 将标点移到第一行末尾
+                    adjustedFirstLine = firstLine + String(firstChar)
+                    adjustedSecondLine = String(secondLine.dropFirst())
+                }
+            }
+            
+            // 检查第一行是否以标点结尾（不允许标点单独成行）
+            // 这里不需要处理，因为第一行是前半部分
+            
+            // 确保两行长度合理
+            if adjustedSecondLine.isEmpty {
+                return adjustedFirstLine
+            }
+            
+            return adjustedFirstLine + "\n" + adjustedSecondLine
+        }
+        
+        return trimmed
+    }
+    
+    /// 强制将文本分为两行，每行不超过 maxChars
+    private func forceWrapTwoLines(_ text: String, maxChars: Int, breakPunctuation: Set<Character>, endPunctuation: Set<Character>) -> String {
+        let breakPos = maxChars
+        let breakIndex = text.index(text.startIndex, offsetBy: breakPos)
+        
+        var firstLine = String(text[..<breakIndex])
+        var secondLine = String(text[breakIndex...])
+        
+        // 调整标点位置，确保标点不单独成行
+        if let firstCharOfSecond = secondLine.first {
+            if breakPunctuation.contains(firstCharOfSecond) {
+                firstLine += String(firstCharOfSecond)
+                secondLine = String(secondLine.dropFirst())
+            } else if endPunctuation.contains(firstCharOfSecond) {
+                firstLine += String(firstCharOfSecond)
+                secondLine = String(secondLine.dropFirst())
+            }
+        }
+        
+        return firstLine + "\n" + secondLine
     }
 }

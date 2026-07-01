@@ -50,6 +50,10 @@ enum ConfidenceLevel {
 
 struct WhisperService {
     static let shared = WhisperService()
+    
+    // 缓存脚本路径，避免重复查找失败
+    private static var cachedScriptPath: String?
+    private static let scriptPathLock = NSLock()
 
     func transcribe(audioURL: URL, model: String = "", outputDir: URL, settings: AppSettings) async throws -> TranscriptionResult {
         let outputPath = outputDir.appendingPathComponent("transcription.txt")
@@ -367,8 +371,20 @@ struct WhisperService {
         return result
     }
 
+    // 缓存Python路径，避免重复查找
+    private static var cachedPythonPath: String?
+    private static let pythonPathLock = NSLock()
+
     // 静态方法，供外部调用
     static func findPythonWithMLXWhisperStatic() -> String {
+        // 先检查缓存
+        pythonPathLock.lock()
+        if let cached = cachedPythonPath {
+            pythonPathLock.unlock()
+            return cached
+        }
+        pythonPathLock.unlock()
+        
         var candidates: [String] = []
         
         // 1. 通过 which/command -v 动态查找 PATH 中的 python3
@@ -457,6 +473,9 @@ struct WhisperService {
                     let output = String(data: data, encoding: .utf8) ?? ""
                     if output.contains("OK") {
                         print("[WhisperService] Found Python with mlx_whisper at: \(path)")
+                        pythonPathLock.lock()
+                        cachedPythonPath = path
+                        pythonPathLock.unlock()
                         return path
                     }
                 }
@@ -471,8 +490,19 @@ struct WhisperService {
     }
 
     static func getTranscribeScriptPathStatic() -> String {
-        // 首先检查 Bundle 中的脚本
-        if let bundlePath = Bundle.main.path(forResource: "transcribe", ofType: "py", inDirectory: "Resources") {
+        // 先检查缓存
+        scriptPathLock.lock()
+        if let cached = cachedScriptPath {
+            scriptPathLock.unlock()
+            return cached
+        }
+        scriptPathLock.unlock()
+        
+        // 首先检查 Bundle 中的脚本（inDirectory 传 nil，因为资源目录本身就是 Resources）
+        if let bundlePath = Bundle.main.path(forResource: "transcribe", ofType: "py") {
+            scriptPathLock.lock()
+            cachedScriptPath = bundlePath
+            scriptPathLock.unlock()
             return bundlePath
         }
 
@@ -484,6 +514,9 @@ struct WhisperService {
         
         if FileManager.default.fileExists(atPath: scriptPath) {
             print("[WhisperService] Found transcribe script at: \(scriptPath)")
+            scriptPathLock.lock()
+            cachedScriptPath = scriptPath
+            scriptPathLock.unlock()
             return scriptPath
         }
 
@@ -813,117 +846,12 @@ struct WhisperService {
     }
 
     private func findPythonWithMLXWhisper() -> String {
-        var candidates: [String] = []
-        
-        // 1. 通过 which/command -v 动态查找 PATH 中的 python3
-        let envPaths = ["/usr/bin/env", "/bin/sh"]
-        for envPath in envPaths {
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: envPath)
-            process.arguments = ["which", "python3"]
-            
-            let pipe = Pipe()
-            process.standardOutput = pipe
-            process.standardError = Pipe()
-            
-            do {
-                try process.run()
-                process.waitUntilExit()
-                
-                if process.terminationStatus == 0 {
-                    let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                    let path = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                    if !path.isEmpty && FileManager.default.isExecutableFile(atPath: path) {
-                        print("[WhisperService] Found python3 via 'which' at: \(path)")
-                        candidates.append(path)
-                    }
-                }
-            } catch {}
-        }
-        
-        // 2. 扫描用户主目录下的常见虚拟环境
-        let homeDir = NSHomeDirectory()
-        if let homeContents = try? FileManager.default.contentsOfDirectory(atPath: homeDir) {
-            for item in homeContents {
-                let fullPath = (homeDir as NSString).appendingPathComponent(item)
-                var isDir: ObjCBool = false
-                if FileManager.default.fileExists(atPath: fullPath, isDirectory: &isDir), isDir.boolValue {
-                    let venvPath = (fullPath as NSString).appendingPathComponent(".venv/bin/python3")
-                    if FileManager.default.isExecutableFile(atPath: venvPath) {
-                        candidates.append(venvPath)
-                    }
-                    let venvPath2 = (fullPath as NSString).appendingPathComponent("venv/bin/python3")
-                    if FileManager.default.isExecutableFile(atPath: venvPath2) {
-                        candidates.append(venvPath2)
-                    }
-                }
-            }
-        }
-        
-        // 3. 常见系统路径
-        let systemPaths = [
-            "/usr/local/bin/python3",
-            "/opt/homebrew/bin/python3",
-            "/usr/bin/python3",
-        ]
-        candidates.append(contentsOf: systemPaths)
-        
-        // 去重并检查每个候选
-        var checked = Set<String>()
-        for path in candidates {
-            guard !checked.contains(path), FileManager.default.isExecutableFile(atPath: path) else { continue }
-            checked.insert(path)
-            
-            // 检查是否包含 mlx_whisper
-            let checkProcess = Process()
-            checkProcess.executableURL = URL(fileURLWithPath: path)
-            checkProcess.arguments = ["-c", "import mlx_whisper; print('OK')"]
-            
-            let pipe = Pipe()
-            checkProcess.standardOutput = pipe
-            checkProcess.standardError = pipe
-            
-            do {
-                try checkProcess.run()
-                checkProcess.waitUntilExit()
-                
-                if checkProcess.terminationStatus == 0 {
-                    let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                    let output = String(data: data, encoding: .utf8) ?? ""
-                    if output.contains("OK") {
-                        print("[WhisperService] Found Python with mlx_whisper at: \(path)")
-                        return path
-                    }
-                }
-            } catch {
-                print("[WhisperService] Error checking \(path): \(error)")
-            }
-        }
-        
-        // 如果都找不到，返回系统默认的 python3
-        print("[WhisperService] Warning: No Python with mlx_whisper found, falling back to system python3")
-        return "/usr/bin/python3"
+        return Self.findPythonWithMLXWhisperStatic()
     }
 
     private func getTranscribeScriptPath() -> String {
-        // 首先检查 Bundle 中的脚本
-        if let bundlePath = Bundle.main.path(forResource: "transcribe", ofType: "py", inDirectory: "Resources") {
-            return bundlePath
-        }
-
-        // 使用当前文件位置推导脚本路径（开发环境）
-        let currentFile = #file
-        let currentDir = (currentFile as NSString).deletingLastPathComponent
-        let projectDir = (currentDir as NSString).deletingLastPathComponent // Services -> mediamind
-        let scriptPath = (projectDir as NSString).appendingPathComponent("Resources/transcribe.py")
-        
-        if FileManager.default.fileExists(atPath: scriptPath) {
-            print("[WhisperService] Found transcribe script at: \(scriptPath)")
-            return scriptPath
-        }
-
-        print("[WhisperService] Error: transcribe.py not found")
-        return ""
+        // 使用静态缓存，避免重复查找
+        return Self.getTranscribeScriptPathStatic()
     }
 }
 

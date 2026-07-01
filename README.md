@@ -182,7 +182,7 @@ ollama serve
 
 ```bash
 # 1. 克隆仓库
-git clone https://github.com/RichardHsiang/mediamind.git
+git clone https://github.com/your-username/mediamind.git
 cd mediamind
 
 # 2. 打开 Xcode 项目
@@ -198,7 +198,7 @@ open mediamind.xcodeproj
 
 ### 发布版本
 
-从 [Releases](https://github.com/RichardHsiang/mediamind/releases) 页面下载最新的 `.dmg` 安装包。
+从 [Releases](https://github.com/your-username/mediamind/releases) 页面下载最新的 `.dmg` 安装包。
 
 ***
 
@@ -366,11 +366,11 @@ A:
 
 ## 项目状态
 
-- **版本**: 2.0.1
+- **版本**: 2.0.3
 - **开发状态**: 活跃开发
-- **最后更新**: 2026-05-28
+- **最后更新**: 2026-07-01
 - **兼容性**: macOS 14.6+
-- **最新功能**: 智能字幕翻译系统（三步流程 + 增强校验）
+- **最新功能**: 文档同名文件夹组织、字幕智能换行、提示词自定义
 
 ***
 

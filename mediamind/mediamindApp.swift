@@ -2,8 +2,6 @@
 //  mediamindApp.swift
 //  mediamind
 //
-//  Created by RichardHsiang on 2026/5/15.
-//
 
 import SwiftUI
 import SwiftData
