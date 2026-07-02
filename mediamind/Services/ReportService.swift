@@ -324,15 +324,26 @@ struct ReportService {
 
     private func generateSRT(segments: [TranscriptionSegment]) -> String {
         var lines: [String] = []
-        for (index, segment) in segments.enumerated() {
-            lines.append("\(index + 1)")
-            lines.append("\(formatSRTTime(segment.startTime)) --> \(formatSRTTime(segment.endTime))")
+        var currentIndex = 1
+        
+        for segment in segments {
             // 二次检查：确保字幕内容纯净，移除 [x] 序号等非字幕内容
             let cleanedText = cleanSubtitleContent(segment.text)
-            // 自动换行：保持每行字数在18-25字之间，最多两行
-            let wrappedText = wrapSubtitleText(cleanedText, minChars: 18, maxChars: 25)
-            lines.append(wrappedText)
-            lines.append("")
+            
+            // 如果超过25字，切分成多条字幕
+            let splitSegments = splitLongSubtitle(
+                text: cleanedText,
+                startTime: segment.startTime,
+                endTime: segment.endTime
+            )
+            
+            for splitSeg in splitSegments {
+                lines.append("\(currentIndex)")
+                lines.append("\(splitSeg.startTime) --> \(splitSeg.endTime)")
+                lines.append(splitSeg.text)
+                lines.append("")
+                currentIndex += 1
+            }
         }
         return lines.joined(separator: "\n")
     }
@@ -435,133 +446,125 @@ struct ReportService {
             cleaned = regex.stringByReplacingMatches(in: cleaned, options: [], range: range, withTemplate: "")
         }
         
+        // 4. 将换行符替换为空格，确保字幕始终在一行显示
+        cleaned = cleaned.replacingOccurrences(of: "\n", with: " ")
+        cleaned = cleaned.replacingOccurrences(of: "\r", with: " ")
+        
+        // 5. 压缩多个连续空格为单个空格
+        if let regex = try? NSRegularExpression(pattern: "\\s+") {
+            let range = NSRange(cleaned.startIndex..., in: cleaned)
+            cleaned = regex.stringByReplacingMatches(in: cleaned, options: [], range: range, withTemplate: " ")
+        }
+        
         return cleaned.trimmingCharacters(in: .whitespaces)
     }
     
-    /// 字幕文本自动换行，最多只分为上下两行，保持每行字数相当（18-25字之间）
-    /// - 标点符号不允许单独占据一行
-    private func wrapSubtitleText(_ text: String, minChars: Int = 18, maxChars: Int = 25) -> String {
-        // 如果文本已经包含换行符，说明已经格式化过，直接返回
-        if text.contains("\n") {
-            return text
+    /// 将超长字幕切分成多条独立条目
+    /// - Parameters:
+    ///   - text: 字幕文本
+    ///   - startTime: 开始时间（格式：HH:mm:ss,SSS 或 HH:mm:ss.SSS）
+    ///   - endTime: 结束时间（格式：HH:mm:ss,SSS 或 HH:mm:ss.SSS）
+    /// - Returns: 切分后的字幕条目数组
+    private func splitLongSubtitle(text: String, startTime: String, endTime: String) -> [(text: String, startTime: String, endTime: String)] {
+        // 降低最大字符数到18字，避免播放器自动换行
+        let maxChars = 18
+        
+        // 如果不超过18字，直接返回
+        if text.count <= maxChars {
+            return [(text: text, startTime: startTime, endTime: endTime)]
         }
         
-        // 清理文本：去除首尾空白
-        let trimmed = text.trimmingCharacters(in: .whitespaces)
+        // 解析时间戳
+        let startSeconds = parseSRTTimeToSeconds(startTime)
+        let endSeconds = parseSRTTimeToSeconds(endTime)
+        let duration = endSeconds - startSeconds
         
-        // 如果文本长度小于等于最大字符数，不需要换行
-        if trimmed.count <= maxChars {
-            return trimmed
+        guard duration > 0 else {
+            return [(text: text, startTime: startTime, endTime: endTime)]
         }
         
-        // 标点符号集合（用于断行，但不能单独成行）
-        let breakPunctuation: Set<Character> = ["，", "、", "；", "：", ",", ";", ":", " "]
-        let endPunctuation: Set<Character> = ["。", "！", "？", ".", "!", "?"]
+        var results: [(text: String, startTime: String, endTime: String)] = []
+        var remainingText = text
+        var currentTime = startSeconds
         
-        // 尝试找到最佳的断行位置
-        let totalLength = trimmed.count
-        let idealBreakPos = totalLength / 2 // 理想断点位置（中间）
-        
-        // 搜索范围：在 minChars 到 maxChars 之间寻找最佳断点
-        let searchStart = max(minChars, idealBreakPos - 5)
-        let searchEnd = min(maxChars, totalLength - minChars)
-        
-        // 如果总长度超过两行最大限制（50字），则强制断在 maxChars 处
-        if totalLength > maxChars * 2 {
-            return forceWrapTwoLines(trimmed, maxChars: maxChars, breakPunctuation: breakPunctuation)
-        }
-        
-        // 在搜索范围内寻找最佳断点
-        var bestBreakIndex: String.Index? = nil
-        var bestScore = Int.max
-        
-        let searchStartIndex = trimmed.index(trimmed.startIndex, offsetBy: searchStart)
-        let searchEndIndex = trimmed.index(trimmed.startIndex, offsetBy: searchEnd)
-        
-        var currentIndex = searchStartIndex
-        while currentIndex <= searchEndIndex {
-            let char = trimmed[currentIndex]
-            if breakPunctuation.contains(char) {
-                // 检查断点后的字符是否不是标点
-                let nextIndex = trimmed.index(after: currentIndex)
-                if nextIndex < trimmed.endIndex {
-                    let nextChar = trimmed[nextIndex]
-                    if !breakPunctuation.contains(nextChar) && !endPunctuation.contains(nextChar) {
-                        // 计算评分：越接近理想断点位置越好
-                        let distance = abs(trimmed.distance(from: trimmed.startIndex, to: currentIndex) - idealBreakPos)
-                        if distance < bestScore {
-                            bestScore = distance
-                            bestBreakIndex = trimmed.index(after: currentIndex) // 断在标点之后
-                        }
-                    }
-                }
-            }
-            currentIndex = trimmed.index(after: currentIndex)
-        }
-        
-        // 如果没找到合适的标点断点，在范围内寻找空格处断行
-        if bestBreakIndex == nil {
-            currentIndex = searchStartIndex
-            while currentIndex <= searchEndIndex {
-                let char = trimmed[currentIndex]
-                if char == " " {
-                    bestBreakIndex = trimmed.index(after: currentIndex)
-                    break
-                }
-                currentIndex = trimmed.index(after: currentIndex)
-            }
-        }
-        
-        // 如果还是没有找到合适的断点，在中间位置强制断行
-        if bestBreakIndex == nil {
-            let midPos = totalLength / 2
-            bestBreakIndex = trimmed.index(trimmed.startIndex, offsetBy: midPos)
-        }
-        
-        // 生成分行结果
-        if let breakIdx = bestBreakIndex {
-            let firstLine = String(trimmed[..<breakIdx]).trimmingCharacters(in: .whitespaces)
-            let secondLine = String(trimmed[breakIdx...]).trimmingCharacters(in: .whitespaces)
-            
-            // 检查第二行是否以标点开头，如果是则调整到第一行末尾
-            var adjustedFirstLine = firstLine
-            var adjustedSecondLine = secondLine
-            
-            if let firstChar = secondLine.first {
-                if breakPunctuation.contains(firstChar) || endPunctuation.contains(firstChar) {
-                    adjustedFirstLine = firstLine + String(firstChar)
-                    adjustedSecondLine = String(secondLine.dropFirst())
-                }
+        while !remainingText.isEmpty {
+            // 如果剩余文本不超过25字，直接添加
+            if remainingText.count <= maxChars {
+                results.append((text: remainingText, startTime: formatSRTTimeFromSeconds(currentTime), endTime: formatSRTTimeFromSeconds(endSeconds)))
+                break
             }
             
-            // 确保两行长度合理
-            if adjustedSecondLine.isEmpty {
-                return adjustedFirstLine
-            }
+            // 寻找切分点
+            let splitIndex = findSplitPoint(in: remainingText, maxChars: maxChars)
             
-            return adjustedFirstLine + "\n" + adjustedSecondLine
+            // 切分文本
+            let partText = String(remainingText.prefix(splitIndex))
+            remainingText = String(remainingText.dropFirst(splitIndex)).trimmingCharacters(in: .whitespaces)
+            
+            // 计算时间（按字数比例分配）
+            let partDuration = duration * Double(splitIndex) / Double(text.count)
+            let partEndTime = currentTime + partDuration
+            
+            results.append((
+                text: partText,
+                startTime: formatSRTTimeFromSeconds(currentTime),
+                endTime: formatSRTTimeFromSeconds(partEndTime)
+            ))
+            
+            currentTime = partEndTime
         }
         
-        return trimmed
+        return results
     }
     
-    /// 强制将文本分为两行，每行不超过 maxChars
-    private func forceWrapTwoLines(_ text: String, maxChars: Int, breakPunctuation: Set<Character>) -> String {
-        let breakPos = maxChars
-        let breakIndex = text.index(text.startIndex, offsetBy: breakPos)
+    /// 在文本中寻找合适的切分点
+    private func findSplitPoint(in text: String, maxChars: Int) -> Int {
+        // 优先基于标点符号切分
+        let splitChars: Set<Character> = ["，", "。", "；", "！", "？", ",", ".", ";", "!", "?"]
         
-        var firstLine = String(text[..<breakIndex])
-        var secondLine = String(text[breakIndex...])
+        // 在 maxChars 范围内寻找最后一个标点符号
+        let limit = min(maxChars, text.count)
+        var lastPunctuationOffset = -1
         
-        // 调整标点位置，确保标点不单独成行
-        if let firstCharOfSecond = secondLine.first {
-            if breakPunctuation.contains(firstCharOfSecond) {
-                firstLine += String(firstCharOfSecond)
-                secondLine = String(secondLine.dropFirst())
+        for offset in 0..<limit {
+            let index = text.index(text.startIndex, offsetBy: offset)
+            if splitChars.contains(text[index]) {
+                lastPunctuationOffset = offset + 1
             }
         }
         
-        return firstLine + "\n" + secondLine
+        // 如果找到了标点符号，在标点后切分
+        if lastPunctuationOffset > 0 && lastPunctuationOffset < text.count {
+            return lastPunctuationOffset
+        }
+        
+        // 如果没有标点符号，直接按 maxChars 切分
+        return min(maxChars, text.count)
+    }
+    
+    /// 解析 SRT 时间戳为秒数
+    private func parseSRTTimeToSeconds(_ timeString: String) -> Double {
+        // 支持格式：HH:mm:ss,SSS 或 HH:mm:ss.SSS
+        let normalized = timeString.replacingOccurrences(of: ",", with: ".")
+        let components = normalized.split(separator: ":")
+        
+        guard components.count == 3 else { return 0 }
+        
+        let hours = Double(components[0]) ?? 0
+        let minutes = Double(components[1]) ?? 0
+        let seconds = Double(components[2]) ?? 0
+        
+        return hours * 3600 + minutes * 60 + seconds
+    }
+    
+    /// 格式化秒数为 SRT 时间戳
+    private func formatSRTTimeFromSeconds(_ seconds: Double) -> String {
+        let hours = Int(seconds) / 3600
+        let minutes = (Int(seconds) % 3600) / 60
+        let secs = Int(seconds) % 60
+        let millis = Int((seconds - Double(Int(seconds))) * 1000)
+        
+        return String(format: "%02d:%02d:%02d,%03d", hours, minutes, secs, millis)
     }
 
     private func formatContentForPage(_ content: String) -> String {
