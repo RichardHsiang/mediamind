@@ -182,7 +182,7 @@ ollama serve
 
 ```bash
 # 1. 克隆仓库
-git clone https://github.com/your-username/mediamind.git
+git clone https://github.com/RichardHsiang/mediamind.git
 cd mediamind
 
 # 2. 打开 Xcode 项目
@@ -198,7 +198,7 @@ open mediamind.xcodeproj
 
 ### 发布版本
 
-从 [Releases](https://github.com/your-username/mediamind/releases) 页面下载最新的 `.dmg` 安装包。
+从 [Releases](https://github.com/RichardHsiang/mediamind/releases) 页面下载最新的 `.dmg` 安装包。
 
 ***
 
