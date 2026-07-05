@@ -42,6 +42,7 @@ class ProcessingContext {
     var analysis: String?
     var generatedFiles: [URL] = []
     var screenshotURLs: [URL] = []
+    var videoWidth: Int? = nil  // 视频宽度（像素），用于字幕切分
 
     // 进度回调
     var onProgressUpdate: ((Double, String) -> Void)?

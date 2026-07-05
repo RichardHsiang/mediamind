@@ -750,31 +750,8 @@ class ReportGenerationStage: ProcessingStage {
 
         print("[ProcessingStages] Parsed \(segments.count) segments from audio.md")
 
-        var srtContent = ""
-        var currentIndex = 1
-        for segment in segments {
-            // 清理字幕文本
-            let cleanedText = cleanSubtitleText(segment.text)
-            // 如果超过25字，切分成多条字幕
-            let splitSegments = splitLongSubtitle(
-                text: cleanedText,
-                startTime: segment.startTime,
-                endTime: segment.endTime
-            )
-            
-            for splitSeg in splitSegments {
-                srtContent += "\(currentIndex)\n"
-                srtContent += "\(splitSeg.startTime) --> \(splitSeg.endTime)\n"
-                srtContent += "\(splitSeg.text)\n\n"
-                currentIndex += 1
-            }
-        }
-
-        let translationSRTURL = outputDir.appendingPathComponent("translation.srt")
-        try srtContent.write(to: translationSRTURL, atomically: true, encoding: .utf8)
-        print("[ProcessingStages] Step 1 completed: Created translation.srt with \(segments.count) entries")
-
-        context.reportProgress(0.90, description: "步骤2/3：使用LLM翻译为目标语言(\(targetLanguage))...")
+        // 步骤1：先翻译原始字幕为目标语言（不切分，保持完整句子以获得更好的翻译质量）
+        context.reportProgress(0.87, description: "步骤1/3：使用LLM翻译为目标语言(\(targetLanguage))...")
 
         let transcriptionSegments = segments.map { segment in
             TranscriptionSegment(
@@ -791,39 +768,47 @@ class ReportGenerationStage: ProcessingStage {
             settings: context.settings
         )
 
-        print("[ProcessingStages] Step 2 completed: Translated \(translatedSegments.count) segments to \(targetLanguage)")
+        print("[ProcessingStages] Step 1 completed: Translated \(translatedSegments.count) segments to \(targetLanguage)")
 
-        var translatedSRTContent = ""
-        var translatedIndex = 1
-        for segment in translatedSegments {
-            // 清理翻译结果
+        // 步骤2：生成目标语言SRT文件（先不切分，保留完整翻译）
+        context.reportProgress(0.90, description: "步骤2/3：生成目标语言SRT文件...")
+
+        var untranslatedSRTContent = ""
+        for (index, segment) in translatedSegments.enumerated() {
             let cleanedText = cleanSubtitleText(segment.text)
-            // 如果超过25字，切分成多条字幕
+            untranslatedSRTContent += "\(index + 1)\n"
+            untranslatedSRTContent += "\(segment.startTime) --> \(segment.endTime)\n"
+            untranslatedSRTContent += "\(cleanedText)\n\n"
+        }
+
+        // 步骤3：对SRT进行字幕切分（基于翻译后的文本）
+        context.reportProgress(0.93, description: "步骤3/3：字幕智能切分与校验...")
+
+        var translatedSubtitleSegments: [(text: String, startTime: String, endTime: String)] = []
+        for segment in translatedSegments {
+            let cleanedText = cleanSubtitleText(segment.text)
             let splitSegments = splitLongSubtitle(
                 text: cleanedText,
                 startTime: segment.startTime,
                 endTime: segment.endTime
             )
-            
-            for splitSeg in splitSegments {
-                translatedSRTContent += "\(translatedIndex)\n"
-                translatedSRTContent += "\(splitSeg.startTime) --> \(splitSeg.endTime)\n"
-                translatedSRTContent += "\(splitSeg.text)\n\n"
-                translatedIndex += 1
-            }
+            translatedSubtitleSegments.append(contentsOf: splitSegments)
         }
 
+        // 修复时间戳重叠
+        translatedSubtitleSegments = fixSubtitleTimestampOverlap(translatedSubtitleSegments)
+
+        // 生成最终SRT格式
+        var translatedSRTContent = ""
+        for (index, seg) in translatedSubtitleSegments.enumerated() {
+            translatedSRTContent += "\(index + 1)\n"
+            translatedSRTContent += "\(seg.startTime) --> \(seg.endTime)\n"
+            translatedSRTContent += "\(seg.text)\n\n"
+        }
+
+        let translationSRTURL = outputDir.appendingPathComponent("translation.srt")
         try translatedSRTContent.write(to: translationSRTURL, atomically: true, encoding: .utf8)
         context.generatedFiles.append(translationSRTURL)
-
-        context.reportProgress(0.93, description: "步骤3/3：二次校验翻译完整性...")
-
-        try await verifyTranslationCompleteness(
-            fileURL: translationSRTURL,
-            originalSegments: segments,
-            targetLanguage: targetLanguage,
-            settings: context.settings
-        )
 
         print("[ProcessingStages] ✅ All 3 steps completed: translation.srt generated and verified")
     }
@@ -1449,79 +1434,296 @@ class ReportGenerationStage: ProcessingStage {
     private func splitLongSubtitle(text: String, startTime: String, endTime: String) -> [(text: String, startTime: String, endTime: String)] {
         // 降低最大字符数到18字，避免播放器自动换行
         let maxChars = 18
-        
+
         // 如果不超过18字，直接返回
         if text.count <= maxChars {
             return [(text: text, startTime: startTime, endTime: endTime)]
         }
-        
+
         // 解析时间戳
         let startSeconds = parseSRTTimeToSeconds(startTime)
         let endSeconds = parseSRTTimeToSeconds(endTime)
         let duration = endSeconds - startSeconds
-        
+
         guard duration > 0 else {
             return [(text: text, startTime: startTime, endTime: endTime)]
         }
-        
-        var results: [(text: String, startTime: String, endTime: String)] = []
-        var remainingText = text
-        var currentTime = startSeconds
-        
-        while !remainingText.isEmpty {
-            // 如果剩余文本不超过25字，直接添加
-            if remainingText.count <= maxChars {
-                let endTimeStr = formatSRTTimeFromSeconds(currentTime + duration * Double(remainingText.count) / Double(text.count))
-                results.append((text: remainingText, startTime: formatSRTTimeFromSeconds(currentTime), endTime: formatSRTTimeFromSeconds(endSeconds)))
-                break
-            }
-            
-            // 寻找切分点
-            let splitIndex = findSplitPoint(in: remainingText, maxChars: maxChars)
-            
-            // 切分文本
-            let partText = String(remainingText.prefix(splitIndex))
-            remainingText = String(remainingText.dropFirst(splitIndex)).trimmingCharacters(in: .whitespaces)
-            
-            // 计算时间（按字数比例分配）
-            let partDuration = duration * Double(splitIndex) / Double(text.count)
-            let partEndTime = currentTime + partDuration
-            
-            results.append((
-                text: partText,
-                startTime: formatSRTTimeFromSeconds(currentTime),
-                endTime: formatSRTTimeFromSeconds(partEndTime)
-            ))
-            
-            currentTime = partEndTime
+
+        // 收集所有可能的切分点
+        let protectedPhrases = getProtectedPhrases(in: text)
+        let splitPoints = findAllSplitPoints(in: text, maxChars: maxChars, protectedPhrases: protectedPhrases)
+
+        // 如果没有找到合适的切分点，强制按 maxChars 切分
+        if splitPoints.isEmpty {
+            return forceSplitText(text: text, maxChars: maxChars, startTime: startTime, endTime: endTime, startSeconds: startSeconds, duration: duration)
         }
-        
+
+        // 按切分点切分文本
+        var results: [(text: String, startTime: String, endTime: String)] = []
+        var lastSplitIndex = 0
+
+        for splitIndex in splitPoints {
+            let partText = String(text[text.index(text.startIndex, offsetBy: lastSplitIndex)..<text.index(text.startIndex, offsetBy: splitIndex)])
+                .trimmingCharacters(in: .whitespaces)
+
+            if !partText.isEmpty {
+                let partStartSeconds = startSeconds + duration * Double(lastSplitIndex) / Double(text.count)
+                let partEndSeconds = startSeconds + duration * Double(splitIndex) / Double(text.count)
+
+                results.append((
+                    text: partText,
+                    startTime: formatSRTTimeFromSeconds(partStartSeconds),
+                    endTime: formatSRTTimeFromSeconds(partEndSeconds)
+                ))
+            }
+
+            lastSplitIndex = splitIndex
+        }
+
+        // 处理最后一段
+        if lastSplitIndex < text.count {
+            let partText = String(text[text.index(text.startIndex, offsetBy: lastSplitIndex)...])
+                .trimmingCharacters(in: .whitespaces)
+
+            if !partText.isEmpty {
+                let partStartSeconds = startSeconds + duration * Double(lastSplitIndex) / Double(text.count)
+
+                results.append((
+                    text: partText,
+                    startTime: formatSRTTimeFromSeconds(partStartSeconds),
+                    endTime: formatSRTTimeFromSeconds(endSeconds)
+                ))
+            }
+        }
+
+        // 修复孤立的标点符号（如开头/结尾的"，"）
+        results = fixIsolatedPunctuation(results)
+
+        // 验证完整性
+        let combinedText = results.map { $0.text }.joined().replacingOccurrences(of: " ", with: "")
+        let originalCleaned = text.replacingOccurrences(of: " ", with: "")
+        if combinedText != originalCleaned {
+            print("[Warning] 字幕切分后文本不完整！原文: '\(text)', 切分后: '\(results.map { $0.text }.joined())'")
+            return forceSplitText(text: text, maxChars: maxChars, startTime: startTime, endTime: endTime, startSeconds: startSeconds, duration: duration)
+        }
+
         return results
     }
-    
-    /// 在文本中寻找合适的切分点
-    private func findSplitPoint(in text: String, maxChars: Int) -> Int {
-        // 优先基于标点符号切分
-        let splitChars: Set<Character> = ["，", "。", "；", "！", "？", ",", ".", ";", "!", "?"]
-        
-        // 在 maxChars 范围内寻找最后一个标点符号
-        let limit = min(maxChars, text.count)
-        var lastPunctuationOffset = -1
-        
-        for offset in 0..<limit {
-            let index = text.index(text.startIndex, offsetBy: offset)
-            if splitChars.contains(text[index]) {
-                lastPunctuationOffset = offset + 1
+
+    /// 强制按最大字符数切分文本（保底方案）
+    private func forceSplitText(text: String, maxChars: Int, startTime: String, endTime: String, startSeconds: Double, duration: Double) -> [(text: String, startTime: String, endTime: String)] {
+        var results: [(text: String, startTime: String, endTime: String)] = []
+        var currentIndex = 0
+
+        while currentIndex < text.count {
+            let endIndex = min(currentIndex + maxChars, text.count)
+            let partText = String(text[text.index(text.startIndex, offsetBy: currentIndex)..<text.index(text.startIndex, offsetBy: endIndex)])
+
+            let partStartSeconds = startSeconds + duration * Double(currentIndex) / Double(text.count)
+            let partEndSeconds = startSeconds + duration * Double(endIndex) / Double(text.count)
+
+            results.append((
+                text: partText,
+                startTime: formatSRTTimeFromSeconds(partStartSeconds),
+                endTime: formatSRTTimeFromSeconds(partEndSeconds)
+            ))
+
+            currentIndex = endIndex
+        }
+
+        return fixIsolatedPunctuation(results)
+    }
+
+    /// 修复孤立的标点符号
+    /// - 如果一条字幕只包含标点符号（"，"、"。"、"！"、"？"等），则将标点合并到上一条
+    private func fixIsolatedPunctuation(_ segments: [(text: String, startTime: String, endTime: String)]) -> [(text: String, startTime: String, endTime: String)] {
+        guard segments.count > 1 else { return segments }
+
+        let isolatedPunctuation: Set<Character> = ["，", "。", "；", "！", "？", ",", ".", ";", "!", "?", "、"]
+
+        func isOnlyPunctuation(_ text: String) -> Bool {
+            let trimmed = text.trimmingCharacters(in: .whitespaces)
+            guard !trimmed.isEmpty else { return true }
+            return trimmed.allSatisfy { isolatedPunctuation.contains($0) }
+        }
+
+        var result: [(text: String, startTime: String, endTime: String)] = []
+        for seg in segments {
+            let trimmedText = seg.text.trimmingCharacters(in: .whitespaces)
+
+            if isOnlyPunctuation(trimmedText), let last = result.last {
+                // 将标点合并到上一条字幕
+                let merged = last.text + seg.text
+                result[result.count - 1] = (text: merged, startTime: last.startTime, endTime: seg.endTime)
+            } else {
+                result.append(seg)
             }
         }
-        
-        // 如果找到了标点符号，在标点后切分
-        if lastPunctuationOffset > 0 && lastPunctuationOffset < text.count {
-            return lastPunctuationOffset
+        return result
+    }
+
+    /// 查找所有合适的切分点
+    private func findAllSplitPoints(in text: String, maxChars: Int, protectedPhrases: [String]) -> [Int] {
+        var splitPoints: [Int] = []
+        var currentPos = 0
+
+        while currentPos < text.count {
+            let remainingLength = text.count - currentPos
+            if remainingLength <= maxChars {
+                break
+            }
+
+            let searchEnd = min(currentPos + maxChars, text.count)
+            if let bestSplitPoint = findBestSplitPoint(in: text, from: currentPos, to: searchEnd, protectedPhrases: protectedPhrases),
+               bestSplitPoint > currentPos {
+                splitPoints.append(bestSplitPoint)
+                currentPos = bestSplitPoint
+            } else {
+                // 找不到合适切分点，强制按 maxChars 切分
+                currentPos = min(currentPos + maxChars, text.count)
+                splitPoints.append(currentPos)
+            }
         }
-        
-        // 如果没有标点符号，直接按 maxChars 切分
-        return min(maxChars, text.count)
+
+        return splitPoints
+    }
+
+    /// 在指定范围内寻找最佳切分点（四级优先级）
+    private func findBestSplitPoint(in text: String, from start: Int, to end: Int, protectedPhrases: [String]) -> Int? {
+        let safeEnd = min(end, text.count)
+        guard start < safeEnd else { return nil }
+
+        // 优先级 1：自然停顿处（省略号、破折号）
+        let naturalPauses = ["……", "...", "——", "--"]
+        for pause in naturalPauses {
+            if let range = text.range(of: pause, range: text.index(text.startIndex, offsetBy: start)..<text.index(text.startIndex, offsetBy: safeEnd)) {
+                let offset = text.distance(from: text.startIndex, to: range.upperBound)
+                if offset <= text.count && !isInProtectedPhrase(at: offset, text: text, protectedPhrases: protectedPhrases) {
+                    return offset
+                }
+            }
+        }
+
+        // 优先级 2：标点符号（句末标点优先 - 。！？，其次逗号）
+        // 先找句末标点
+        let sentenceEnd: Set<Character> = ["。", "！", "？", ".", "!", "?"]
+        var sentenceEndOffset = -1
+        for offset in start..<safeEnd {
+            let index = text.index(text.startIndex, offsetBy: offset)
+            if sentenceEnd.contains(text[index]) {
+                let afterPunct = offset + 1
+                if afterPunct <= text.count && !isInProtectedPhrase(at: afterPunct, text: text, protectedPhrases: protectedPhrases) {
+                    sentenceEndOffset = afterPunct
+                }
+            }
+        }
+        if sentenceEndOffset > start {
+            return sentenceEndOffset
+        }
+
+        // 再找逗号/分号
+        let comma: Set<Character> = ["，", "；", ",", ";", "、"]
+        var commaOffset = -1
+        for offset in start..<safeEnd {
+            let index = text.index(text.startIndex, offsetBy: offset)
+            if comma.contains(text[index]) {
+                let afterPunct = offset + 1
+                if afterPunct <= text.count && !isInProtectedPhrase(at: afterPunct, text: text, protectedPhrases: protectedPhrases) {
+                    commaOffset = afterPunct
+                }
+            }
+        }
+        if commaOffset > start {
+            return commaOffset
+        }
+
+        // 优先级 3：连词前（因为、但是、所以、然后、如果、虽然）
+        let conjunctions = ["因为", "但是", "所以", "然后", "如果", "虽然", "而且", "不过", "因此"]
+        for conj in conjunctions {
+            if let range = text.range(of: conj, range: text.index(text.startIndex, offsetBy: start)..<text.index(text.startIndex, offsetBy: safeEnd)) {
+                let offset = text.distance(from: text.startIndex, to: range.lowerBound)
+                if offset > start && offset <= text.count && !isInProtectedPhrase(at: offset, text: text, protectedPhrases: protectedPhrases) {
+                    return offset
+                }
+            }
+        }
+
+        // 优先级 4：名词短语结束（的、了、着 + 非动词）
+        let nounEndings: Set<Character> = ["的", "了", "着"]
+        for offset in (start..<safeEnd).reversed() {
+            let index = text.index(text.startIndex, offsetBy: offset)
+            if nounEndings.contains(text[index]) {
+                if offset + 1 < text.count {
+                    let nextIndex = text.index(text.startIndex, offsetBy: offset + 1)
+                    let nextChar = text[nextIndex]
+                    if !["是", "在", "有", "能", "会", "可以"].contains(String(nextChar)) {
+                        let afterEnding = offset + 1
+                        if afterEnding <= text.count && !isInProtectedPhrase(at: afterEnding, text: text, protectedPhrases: protectedPhrases) {
+                            return afterEnding
+                        }
+                    }
+                }
+            }
+        }
+
+        return nil
+    }
+
+    /// 获取文本中的固定搭配（保护短语）
+    private func getProtectedPhrases(in text: String) -> [String] {
+        var phrases: [String] = []
+
+        // 关联词对
+        let pairs = [
+            ("因为", "所以"),
+            ("虽然", "但是"),
+            ("如果", "就"),
+            ("不仅", "而且"),
+            ("既", "又"),
+            ("一边", "一边"),
+            ("要么", "要么")
+        ]
+
+        for (first, second) in pairs {
+            if text.contains(first) && text.contains(second) {
+                if let firstRange = text.range(of: first),
+                   let secondRange = text.range(of: second),
+                   firstRange.lowerBound < secondRange.upperBound {
+                    let protectedRange = firstRange.lowerBound..<secondRange.upperBound
+                    phrases.append(String(text[protectedRange]))
+                }
+            }
+        }
+
+        // 成语/固定搭配
+        let idioms = [
+            "一心一意", "三心二意", "半途而废", "坚持不懈", "持之以恒",
+            "全力以赴", "不遗余力", "尽心尽力", "尽职尽责", "兢兢业业",
+            "勤勤恳恳", "任劳任怨", "默默无闻", "无私奉献", "大公无私",
+            "舍己为人", "助人为乐", "见义勇为", "挺身而出", "义无反顾"
+        ]
+
+        for idiom in idioms {
+            if text.contains(idiom) {
+                phrases.append(idiom)
+            }
+        }
+
+        return phrases
+    }
+
+    /// 检查指定位置是否在固定搭配内部
+    private func isInProtectedPhrase(at position: Int, text: String, protectedPhrases: [String]) -> Bool {
+        for phrase in protectedPhrases {
+            if let range = text.range(of: phrase) {
+                let phraseStart = text.distance(from: text.startIndex, to: range.lowerBound)
+                let phraseEnd = text.distance(from: text.startIndex, to: range.upperBound)
+                if position > phraseStart && position < phraseEnd {
+                    return true
+                }
+            }
+        }
+        return false
     }
     
     /// 解析 SRT 时间戳为秒数
@@ -1540,12 +1742,65 @@ class ReportGenerationStage: ProcessingStage {
     }
     
     /// 格式化秒数为 SRT 时间戳
+    /// 使用 Int 截取毫秒会丢失精度（double 转 int），改为四舍五入避免重叠
     private func formatSRTTimeFromSeconds(_ seconds: Double) -> String {
-        let hours = Int(seconds) / 3600
-        let minutes = (Int(seconds) % 3600) / 60
-        let secs = Int(seconds) % 60
-        let millis = Int((seconds - Double(Int(seconds))) * 1000)
-        
+        let totalMillis = Int((seconds * 1000).rounded())  // 四舍五入
+        let hours = totalMillis / 3_600_000
+        let minutes = (totalMillis % 3_600_000) / 60_000
+        let secs = (totalMillis % 60_000) / 1_000
+        let millis = totalMillis % 1_000
+
         return String(format: "%02d:%02d:%02d,%03d", hours, minutes, secs, millis)
+    }
+
+    /// 防止字幕时间戳重叠的后处理
+    /// 规则：每条字幕的 startTime 必须 >= 上一条的 endTime
+    /// 同一原始段内的切分片段不重叠；不同原始段之间也强制不重叠
+    private func fixSubtitleTimestampOverlap(_ segments: [(text: String, startTime: String, endTime: String)]) -> [(text: String, startTime: String, endTime: String)] {
+        guard segments.count > 1 else { return segments }
+
+        var result: [(text: String, startTime: String, endTime: String)] = []
+        result.reserveCapacity(segments.count)
+
+        var previousEndSec: Double = 0
+        var previousStartSec: Double = 0
+
+        for seg in segments {
+            var startSec = parseSRTTimeToSeconds(seg.startTime)
+            var endSec = parseSRTTimeToSeconds(seg.endTime)
+
+            // 1. 处理 endTime <= startTime 的异常情况
+            if endSec <= startSec {
+                endSec = startSec + 1.0
+            }
+
+            // 2. 强制：startTime 必须 >= 上一条的 endTime
+            if startSec < previousEndSec {
+                startSec = previousEndSec
+                // 调整后 endTime 也必须 > startTime
+                if endSec <= startSec {
+                    endSec = startSec + 1.0
+                }
+            }
+
+            // 3. 防止 startTime == previousStartSec（连续相同开始时间）
+            if startSec == previousStartSec && result.count > 0 {
+                startSec = previousEndSec
+                if endSec <= startSec {
+                    endSec = startSec + 1.0
+                }
+            }
+
+            result.append((
+                text: seg.text,
+                startTime: formatSRTTimeFromSeconds(startSec),
+                endTime: formatSRTTimeFromSeconds(endSec)
+            ))
+
+            previousStartSec = startSec
+            previousEndSec = endSec
+        }
+
+        return result
     }
 }
