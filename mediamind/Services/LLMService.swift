@@ -498,7 +498,9 @@ struct LLMService {
     }
 
     private func callOllama(baseURL: String, model: String, prompt: String) async throws -> String {
-        guard let url = URL(string: "\(baseURL)/api/generate") else {
+        let apiPath = LLMServiceType.ollama.apiPath
+        let fullURL = baseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/")) + apiPath
+        guard let url = URL(string: fullURL) else {
             throw LLMError.invalidURL
         }
 
@@ -556,7 +558,9 @@ struct LLMService {
     }
 
     private func callLMStudio(baseURL: String, model: String, prompt: String) async throws -> String {
-        guard let url = URL(string: "\(baseURL)/v1/chat/completions") else {
+        let apiPath = LLMServiceType.lmstudio.apiPath
+        let fullURL = baseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/")) + apiPath
+        guard let url = URL(string: fullURL) else {
             throw LLMError.invalidURL
         }
 
@@ -617,6 +621,7 @@ struct LLMService {
     }
 
     func checkServiceAvailability(baseURL: String) async -> Bool {
+        // Ollama 根路径返回 200；LM Studio /v1 路径返回 200
         guard let url = URL(string: baseURL) else { return false }
 
         var request = URLRequest(url: url)

@@ -412,7 +412,7 @@ struct SettingsView: View {
                             .background(Color.gray.opacity(0.1))
                             .cornerRadius(8)
                             
-                            Text("Ollama 默认: http://127.0.0.1:11434 | LM Studio 默认: http://127.0.0.1:1234/v1")
+                            Text("Ollama 默认: http://127.0.0.1:11434 | LM Studio 默认: http://127.0.0.1:1234/v1（切换服务时自动填充）")
                                 .font(.system(size: 12))
                                 .foregroundColor(.appleGray)
                         }
@@ -707,8 +707,11 @@ struct SettingsView: View {
         whisperModels = discoveredWhisperModels
         print("[SettingsView] Whisper models loaded: \(discoveredWhisperModels.count)")
 
-        // 不自动加载LLM模型，避免启动时强制关联Ollama服务
-        // 用户可以通过手动刷新按钮来加载LLM模型
+        // 如果已选择LLM服务，自动加载对应的模型列表
+        if !settings.llmService.isEmpty {
+            await loadLLMModels()
+        }
+
         print("[SettingsView] ========== Done loading models ==========")
 
         isLoadingModels = false
@@ -754,7 +757,7 @@ struct SettingsView: View {
 
         case .lmstudio:
             print("[SettingsView] Attempting to load LM Studio models...")
-            let models = await ModelDiscoveryService.shared.getLMStudioModels(forceRefresh: true)
+            let models = await ModelDiscoveryService.shared.getLMStudioModels(baseURL: settings.llmBaseURL, forceRefresh: true)
             print("[SettingsView] LM Studio returned \(models.count) models: \(models)")
             llmModels = models
 

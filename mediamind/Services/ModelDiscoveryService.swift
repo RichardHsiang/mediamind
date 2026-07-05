@@ -426,18 +426,23 @@ actor ModelDiscoveryService {
 
     // MARK: - LM Studio Models
 
-    func getLMStudioModels(forceRefresh: Bool = false) async -> [String] {
+    func getLMStudioModels(baseURL: String? = nil, forceRefresh: Bool = false) async -> [String] {
         if !forceRefresh, let cache = lmStudioCache, !cache.isExpired {
             let ttlRemaining = cache.ttl - Date().timeIntervalSince(cache.timestamp)
             print("[ModelDiscoveryService] Returning cached LM Studio models (\(cache.models.count) models), cached at \(cache.timestamp), TTL remaining: \(String(format: "%.1f", max(0, ttlRemaining)))s")
             return cache.models
         }
 
-        let endpoints = [
+        // 构建端点列表：优先使用用户配置的地址，再尝试默认地址
+        var endpoints: [String] = []
+        if let customBase = baseURL, !customBase.isEmpty {
+            let trimmed = customBase.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            endpoints.append("\(trimmed)/models")
+        }
+        endpoints.append(contentsOf: [
             "http://127.0.0.1:1234/v1/models",
-            "http://127.0.0.1:1234/api/models",
             "http://localhost:1234/v1/models",
-        ]
+        ])
 
         for endpoint in endpoints {
             guard let url = URL(string: endpoint) else {

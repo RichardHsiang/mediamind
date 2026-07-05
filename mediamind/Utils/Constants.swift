@@ -180,14 +180,14 @@ enum LLMServiceType: String, CaseIterable {
     var defaultBaseURL: String {
         switch self {
         case .ollama: return "http://127.0.0.1:11434"
-        case .lmstudio: return "http://127.0.0.1:1234"
+        case .lmstudio: return "http://127.0.0.1:1234/v1"
         }
     }
 
     var apiPath: String {
         switch self {
         case .ollama: return "/api/generate"
-        case .lmstudio: return "/v1/chat/completions"
+        case .lmstudio: return "/chat/completions"
         }
     }
 }
